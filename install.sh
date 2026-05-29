@@ -13,6 +13,52 @@ need_root() { if [ "$EUID" -eq 0 ]; then "$@"; else sudo "$@"; fi; }
 uhave()     { as_user bash -lc "command -v '$1'" >/dev/null 2>&1; }   # is <cmd> on the real user's PATH?
 ulc()       { as_user bash -lc "$1"; }                                # run a command line as the real user
 
+# If something other than the shim's rg is first on PATH (classic case: Homebrew's
+# rg on Apple Silicon, where /opt/homebrew/bin precedes /usr/local/bin), prepend
+# /usr/local/bin in the user's shell profile so the shim wins. Idempotent.
+fix_path_if_needed() {
+    [ "${FIX_PATH:-1}" -eq 1 ] || return 0
+    [ "$(command -v rg 2>/dev/null)" = "/usr/local/bin/rg" ] && return 0
+
+    # Strategy 1 (preferred, non-root): symlink rg into the first user-writable
+    # directory that's ALREADY ahead of the real rg on PATH. Takes effect with
+    # just `hash -r` — no profile edit, no terminal restart. (Skipped under sudo,
+    # where -w and $PATH reflect root, not the user.)
+    if [ "$EUID" -ne 0 ]; then
+        local IFS=':' dirs d rgdir
+        read -ra dirs <<< "$PATH"
+        rgdir="$(dirname "$(command -v rg 2>/dev/null)" 2>/dev/null)"
+        for d in "${dirs[@]}"; do
+            [ -n "$d" ] || continue
+            [ "$d" = "$rgdir" ] && break          # reached the real rg — stop
+            [ "$d" = "/usr/local/bin" ] && continue
+            if [ -d "$d" ] && [ -w "$d" ]; then
+                if ln -sf /usr/local/bin/smart-rg "$d/rg"; then
+                    echo "  ✓ Linked rg into $d (already ahead of Homebrew on your PATH)"
+                    echo "    → run 'hash -r' (or open a new terminal), then: which rg"
+                    return 0
+                fi
+            fi
+        done
+    fi
+
+    # Strategy 2 (fallback): prepend /usr/local/bin in the shell profile.
+    local rshell prof
+    rshell="$(as_user bash -lc 'echo $SHELL' 2>/dev/null || echo /bin/zsh)"
+    case "$rshell" in
+        */bash) prof="$REAL_HOME/.bash_profile" ;;
+        *)      prof="$REAL_HOME/.zshrc" ;;
+    esac
+    if [ -f "$prof" ] && grep -q 'added by smart-rg installer' "$prof" 2>/dev/null; then
+        echo "  ℹ️  PATH fix already in $prof — restart your terminal (or: source $prof)"
+        return 0
+    fi
+    printf '\n# added by smart-rg installer: put the shim (/usr/local/bin) before Homebrew rg\nexport PATH="/usr/local/bin:$PATH"\n' >> "$prof"
+    [ "$EUID" -eq 0 ] && chown "$REAL_USER" "$prof" 2>/dev/null || true
+    echo "  ✓ Prepended /usr/local/bin to PATH in $prof"
+    echo "    → restart your terminal, or run:  source $prof   (then: which rg)"
+}
+
 # ── Claude Code settings merge (testable, no root, no install needed) ─────────
 # Sets env.USE_BUILTIN_RIPGREP="0" in the given settings.json while preserving
 # everything else. Honors SMARTRG_JSON_ENGINE=jq|python3|auto (default: auto)
@@ -105,17 +151,20 @@ echo ""
 WITH_GREP=0
 CONFIGURE_CLAUDE=1
 INSTALL_DEPS=1
+FIX_PATH=1
 for arg in "$@"; do
   case "$arg" in
     --with-grep) WITH_GREP=1 ;;
     --no-claude-config) CONFIGURE_CLAUDE=0 ;;
     --no-deps) INSTALL_DEPS=0 ;;
+    --no-fix-path) FIX_PATH=0 ;;
     -h|--help)
-      echo "Usage: ./install.sh [--with-grep] [--no-claude-config] [--no-deps]"
+      echo "Usage: ./install.sh [--with-grep] [--no-claude-config] [--no-deps] [--no-fix-path]"
       echo "  (run as a normal user; it uses sudo only for /usr/local/bin)"
       echo "  --with-grep             also intercept 'grep' (shadows system grep; off by default)"
       echo "  --no-claude-config      leave ~/.claude/settings.json untouched"
       echo "  --no-deps               skip auto-installing ast-grep / ripgrep / Rust"
+      echo "  --no-fix-path           don't adjust PATH if another rg shadows the shim"
       echo "  --check                 report what's installed and exit (no changes)"
       echo "  --merge-claude-config [path]   only set USE_BUILTIN_RIPGREP=0 and exit (no root)"
       exit 0 ;;
@@ -201,9 +250,14 @@ fi
 echo ""
 echo "Verifying..."
 echo "  rg → $(command -v rg 2>/dev/null || echo 'NOT FOUND')"
-if [ "$(command -v rg 2>/dev/null)" != "/usr/local/bin/rg" ]; then
-    echo "  ⚠️  PATH puts another rg first. /usr/local/bin must come before it"
-    echo "      (e.g. Homebrew's /opt/homebrew/bin). Check: echo \$PATH"
+if [ "$(command -v rg 2>/dev/null)" = "/usr/local/bin/rg" ]; then
+    echo "  ✓ shim is first on PATH"
+elif [ "$FIX_PATH" -eq 1 ]; then
+    echo "  • another rg is ahead on PATH — fixing so the shim wins:"
+    fix_path_if_needed || true
+else
+    echo "  ⚠️  Another rg is first on PATH. Put /usr/local/bin (or ~/.local/bin) ahead of it,"
+    echo "      e.g.: ln -sf /usr/local/bin/smart-rg ~/.local/bin/rg && hash -r"
 fi
 uhave ast-grep || echo "  ⚠️  ast-grep still not found — structural searches will fall back to text."
 

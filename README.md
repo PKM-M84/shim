@@ -223,7 +223,7 @@ Same idea for devcontainers, CI runners, or any sandbox — get the binary onto 
 
 | Symptom | Fix |
 |---|---|
-| `which rg` shows `/opt/homebrew/bin/rg` | PATH order: `/usr/local/bin` must come *before* Homebrew. Interception is silently off until fixed. |
+| `which rg` shows `/opt/homebrew/bin/rg` | Another `rg` is ahead of the shim on PATH. The installer auto-fixes this (symlinks `rg` into the first writable dir already ahead of Homebrew, e.g. `~/.local/bin`, else prepends `/usr/local/bin` to your shell profile). Run `hash -r` (or open a new terminal) and re-check. To redo by hand: `ln -sf /usr/local/bin/smart-rg ~/.local/bin/rg && hash -r`. Disable the auto-fix with `--no-fix-path`. |
 | Searches work but `smart-rg stats` is empty | You're hitting real `rg` (PATH issue above), **or** Claude Code is using its bundled rg — set `USE_BUILTIN_RIPGREP=0`. |
 | Structural searches all fall through to text | `ast-grep` isn't on PATH. `which ast-grep`; `brew install ast-grep`. |
 | Worked, then stopped after restarting the AI tool | You installed to `~/bin`. Use `/usr/local/bin` (universal PATH for all processes). |
