@@ -1,0 +1,46 @@
+name: install-test
+
+# Free on this public repo (standard GitHub-hosted runners, incl. macOS).
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Fast, cheap checks: the settings-merge unit test + the no-op flags.
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: settings-merge smoke test
+        run: bash tests/install_test.sh
+      - name: --check / --help make no changes and exit 0
+        run: |
+          bash install.sh --check
+          bash install.sh --help
+
+  # The real thing: on a clean macOS runner, run the FULL installer so the
+  # dependency-install + build + /usr/local/bin + Claude-config paths actually
+  # execute (the branches we can't easily exercise on a dev box that already
+  # has everything). The runner has Homebrew + Rust preinstalled; ast-grep is
+  # typically absent, so the `brew install ast-grep` branch gets tested.
+  macos-install:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: settings-merge smoke test
+        run: bash tests/install_test.sh
+      - name: preview deps (no changes)
+        run: bash install.sh --check
+      - name: full install (deps + build + symlink + Claude config)
+        run: bash install.sh
+      - name: verify the install produced a working tool
+        run: |
+          set -euo pipefail
+          test -x /usr/local/bin/smart-rg          # binary in place
+          test -L /usr/local/bin/rg                # rg symlink created
+          /usr/local/bin/smart-rg stats            # runs without error
+          command -v ast-grep                       # runtime dep present
+          python3 -c "import json,os; \
+            d=json.load(open(os.path.expanduser('~/.claude/settings.json'))); \
+            assert d['env']['USE_BUILTIN_RIPGREP']=='0', d"
