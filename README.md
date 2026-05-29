@@ -14,44 +14,33 @@ When your AI coding assistant (Claude Code, Cursor, etc.) searches your code for
 
 ### I just want it to work. What do I do?
 
-**Step 1 — Install the tools shim needs:**
+You don't need anything pre-installed. `install.sh` **checks for and installs what's missing** — ast-grep, ripgrep, and Rust (only if it builds from source). Run it as your **normal user** (not `sudo`); it elevates with `sudo` only to place `rg` in `/usr/local/bin`.
+
+**Option A — fastest (no Rust, no clone): grab the prebuilt binary**
 
 ```bash
-# Rust (to build shim)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# ast-grep (the smart search engine shim uses) + ripgrep (text-search fallback)
-brew install ast-grep ripgrep
-# (ast-grep alternative: npm install -g @ast-grep/cli)
+curl -fsSL https://raw.githubusercontent.com/PKM-M84/shim-/main/install.sh | bash
 ```
 
-> shim runs `ast-grep` by its bare name, so it must be on your `PATH` — check with `which ast-grep`.
+Installs ast-grep + ripgrep (via Homebrew if present), downloads the prebuilt `smart-rg` for your Mac (Apple Silicon or Intel), symlinks `rg`, and configures Claude Code. No Rust required.
 
-**Step 2 — Build it:**
+**Option B — from source (auto-installs Rust if needed):**
 
 ```bash
 git clone https://github.com/PKM-M84/shim-.git
 cd shim-
-cargo build --release
+./install.sh          # checks deps, installs Rust if missing, builds, installs
 ```
 
-**Step 3 — Install it:**
+> Preview without changing anything: `./install.sh --check`. Skip the dependency
+> auto-install with `--no-deps`. All flags: `./install.sh --help`.
+> Add `--with-grep` only if you also want to intercept `grep` (see warning below).
 
-```bash
-chmod +x install.sh && sudo ./install.sh
-# (add --with-grep ONLY if you also want to intercept `grep` — see warning below)
-```
+> **Why `/usr/local/bin`?** It's in macOS's default PATH for every process — terminal, GUI apps, launchd, everything. `~/bin` can break when you restart your AI tool because the new process might not inherit your shell configs. It must come *before* Homebrew's `/opt/homebrew/bin` so your `rg` wins — the installer warns you if it doesn't.
 
-Or manually:
+> **Downloaded the binary in a browser** (from the Releases page) instead of via the installer? macOS may quarantine it — clear it with `xattr -dr com.apple.quarantine /usr/local/bin/smart-rg`. The `curl … | bash` flow above is not quarantined.
 
-```bash
-sudo cp target/release/smart-rg /usr/local/bin/
-sudo ln -sf /usr/local/bin/smart-rg /usr/local/bin/rg
-```
-
-> **Why `/usr/local/bin`?** It's in macOS's default PATH for every process — terminal, GUI apps, launchd, everything. Using `~/bin` can break when you restart your AI tool because the new process might not inherit your shell configs. `/usr/local/bin` Just Works. (It must come *before* Homebrew's `/opt/homebrew/bin` in PATH so your `rg` wins — `install.sh` warns you if it doesn't.)
-
-**Step 4 — Claude Code config (the installer already did this):**
+**Claude Code config (the installer already did this):**
 
 Claude Code ships its **own bundled ripgrep** and ignores your PATH unless you flip one switch. `install.sh` sets it for you — it merges this into `~/.claude/settings.json`:
 
@@ -61,11 +50,11 @@ Claude Code ships its **own bundled ripgrep** and ignores your PATH unless you f
 }
 ```
 
-If you installed manually (or want to check), add/confirm that block yourself. Skip it with `sudo ./install.sh --no-claude-config`. Restart Claude Code so it picks up the new env.
+If you installed manually (or want to check), add/confirm that block yourself. Skip it with `./install.sh --no-claude-config`. Restart Claude Code so it picks up the new env.
 
 Other tools (Cursor, Codex, Aider, …) shell out to `rg`/`grep` on PATH, so they pick up shim automatically — it works with **any** provider (Anthropic, OpenRouter, DeepSeek, etc.) because it intercepts at the *tool* level, not the model.
 
-**Step 5 — Verify:**
+**Verify:**
 
 ```bash
 which rg          # → /usr/local/bin/rg   (NOT /opt/homebrew/bin/rg)
@@ -199,11 +188,11 @@ Two optional env vars:
 
 ## Installation (details)
 
-See [Quick Start](#quick-start) for the simple version. Prerequisites:
+See [Quick Start](#quick-start) for the simple version. `install.sh` installs these for you (unless `--no-deps`); listed here for reference:
 
-- [Rust](https://rustup.rs/) — to build from source
 - [ast-grep](https://ast-grep.github.io/) (`brew install ast-grep` or `npm install -g @ast-grep/cli`) — **must be on PATH**
 - ripgrep (`brew install ripgrep`) — shim falls back to it for text searches
+- [Rust](https://rustup.rs/) — only when building from source (Option B); not needed for the prebuilt binary
 
 ### Claude Code configuration
 
@@ -213,7 +202,7 @@ See [Quick Start](#quick-start) for the simple version. Prerequisites:
 { "env": { "USE_BUILTIN_RIPGREP": "0" } }
 ```
 
-For broader coverage you *can* also intercept `grep` (`sudo ./install.sh --with-grep`), but read the [grep warning](#️-about-intercepting-grep) first.
+For broader coverage you *can* also intercept `grep` (`./install.sh --with-grep`), but read the [grep warning](#️-about-intercepting-grep) first.
 
 ### Cursor, Codex, Copilot CLI, Aider, …
 

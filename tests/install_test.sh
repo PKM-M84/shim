@@ -105,6 +105,10 @@ else
   echo "  ⏭️  engine=python3 skipped (python3 not installed)"
 fi
 
+# 9. --help and --check must succeed with no root and make no changes
+bash "$INSTALL" --help  >/dev/null 2>&1; check "--help exits 0"  "0" "$?"
+bash "$INSTALL" --check >/dev/null 2>&1; check "--check exits 0" "0" "$?"
+
 echo ""
 echo "Result: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
