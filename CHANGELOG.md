@@ -5,6 +5,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-05-31
+
+### Fixed
+
+- **`smart-rg` command not found after install.** The dedicated-bin model
+  installed only `rg`, but the installer's hints (and the docs) reference
+  `smart-rg stats` / `smart-rg report`. The installer now also creates a
+  `smart-rg` command in `~/.smart-rg/bin` (a relative symlink to the same
+  binary, which routes subcommands by argv), and `--uninstall` removes it.
+
 ## [0.3.0] - 2026-05-30
 
 ### Fixed

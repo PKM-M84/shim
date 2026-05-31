@@ -304,7 +304,7 @@ do_uninstall() {
     done < <(target_files)
 
     # New-model artifacts
-    rm -f "$SRG_BIN/rg" "$SRG_BIN/rg2"
+    rm -f "$SRG_BIN/rg" "$SRG_BIN/rg2" "$SRG_BIN/smart-rg"
     rmdir "$SRG_BIN" 2>/dev/null || true
     rm -f "$ENV_SH"
 
@@ -416,6 +416,12 @@ mkdir -p "$SRG_BIN"
 cp "$BIN" "$SRG_BIN/rg"
 chmod +x "$SRG_BIN/rg"
 echo "✓ Installed shim → $SRG_BIN/rg"
+
+# Also expose a `smart-rg` command (relative symlink to the same binary, which
+# routes subcommands by argv) so the documented `smart-rg stats` / `report` work
+# — the dedicated bin dir is already first on PATH.
+ln -sf rg "$SRG_BIN/smart-rg"
+echo "✓ Installed command → $SRG_BIN/smart-rg"
 
 if real="$(resolve_real_rg)"; then
     ln -sf "$real" "$SRG_BIN/rg2"

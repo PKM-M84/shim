@@ -39,8 +39,10 @@ jobs:
           set -euo pipefail
           test -x "$HOME/.smart-rg/bin/rg"          # shim binary in the dedicated dir
           test -L "$HOME/.smart-rg/bin/rg2"         # real-rg symlink created
+          test -L "$HOME/.smart-rg/bin/smart-rg"    # smart-rg command created
           test -f "$HOME/.smart-rg/env.sh"          # PATH drop-in written
           "$HOME/.smart-rg/bin/rg" stats            # shim runs without error
+          "$HOME/.smart-rg/bin/smart-rg" stats      # smart-rg command runs without error
           command -v ast-grep                       # runtime dep present
           python3 -c "import json,os; \
             d=json.load(open(os.path.expanduser('~/.claude/settings.json'))); \
@@ -51,6 +53,7 @@ jobs:
           bash install.sh --uninstall --purge
           test ! -e "$HOME/.smart-rg/bin/rg"        # shim gone
           test ! -e "$HOME/.smart-rg/bin/rg2"       # symlink gone
+          test ! -e "$HOME/.smart-rg/bin/smart-rg"  # smart-rg command gone
           test ! -e "$HOME/.smart-rg/env.sh"        # PATH drop-in gone
           test ! -e "$HOME/.smart-rg"               # data dir purged, no orphans
           echo "uninstall clean ✓"
