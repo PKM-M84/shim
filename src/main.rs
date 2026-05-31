@@ -91,7 +91,7 @@ fn ensure_home() {
 // ── CLI ──────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
-#[command(name = "smart-rg", version = "0.3.1")]
+#[command(name = "smart-rg", version = "0.3.2")]
 #[command(disable_help_flag = true)]
 struct Cli {
     #[command(subcommand)]

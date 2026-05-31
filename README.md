@@ -14,7 +14,7 @@ When your AI coding assistant (Claude Code, Cursor, etc.) searches your code for
 
 ### I just want it to work. What do I do?
 
-You don't need anything pre-installed. `install.sh` **checks for and installs what's missing** — ast-grep, ripgrep, and Rust (only if it builds from source). Run it as your **normal user** (not `sudo`); it elevates with `sudo` only to place `rg` in `/usr/local/bin`.
+You don't need anything pre-installed, and you don't need `sudo`. `install.sh` **checks for and installs what's missing** — ast-grep, ripgrep, and Rust (only if it builds from source) — then sets everything up in your home directory. It's a plain **user install**: no `sudo`, no `/usr/local/bin`.
 
 **Option A — fastest (no Rust, no clone): grab the prebuilt binary**
 
@@ -22,7 +22,7 @@ You don't need anything pre-installed. `install.sh` **checks for and installs wh
 curl -fsSL https://raw.githubusercontent.com/PKM-M84/shim-/main/install.sh | bash
 ```
 
-Installs ast-grep + ripgrep (via Homebrew if present), downloads the prebuilt `smart-rg` for your Mac (Apple Silicon or Intel), symlinks `rg`, and configures Claude Code. No Rust required.
+Installs ast-grep + ripgrep (via Homebrew if present), downloads the prebuilt shim binary for your Mac (Apple Silicon or Intel) to `~/.smart-rg/bin/rg`, puts that directory first on your PATH (via a shell drop-in), and configures Claude Code. No Rust required.
 
 **Option B — from source (auto-installs Rust if needed):**
 
@@ -34,11 +34,10 @@ cd shim-
 
 > Preview without changing anything: `./install.sh --check`. Skip the dependency
 > auto-install with `--no-deps`. All flags: `./install.sh --help`.
-> Add `--with-grep` only if you also want to intercept `grep` (see warning below).
 
-> **Why `/usr/local/bin`?** It's in macOS's default PATH for every process — terminal, GUI apps, launchd, everything. `~/bin` can break when you restart your AI tool because the new process might not inherit your shell configs. It must come *before* Homebrew's `/opt/homebrew/bin` so your `rg` wins — the installer warns you if it doesn't.
+> **Why a dedicated `~/.smart-rg/bin`?** No `sudo` required — the installer owns one directory under your home and never touches system paths. It's forced to the **front** of your PATH via a small drop-in (`~/.smart-rg/env.sh`) sourced from a marked block in your shell startup files, so it survives restarts and wins over Homebrew's `/opt/homebrew/bin`. And because everything lives in one place, uninstalling is clean.
 
-> **Downloaded the binary in a browser** (from the Releases page) instead of via the installer? macOS may quarantine it — clear it with `xattr -dr com.apple.quarantine /usr/local/bin/smart-rg`. The `curl … | bash` flow above is not quarantined.
+> **Downloaded the binary in a browser** (from the Releases page) instead of via the installer? macOS may quarantine it — clear it with `xattr -dr com.apple.quarantine ~/.smart-rg/bin/rg`. The `curl … | bash` flow above is not quarantined.
 
 **Claude Code config (the installer already did this):**
 
@@ -52,12 +51,12 @@ Claude Code ships its **own bundled ripgrep** and ignores your PATH unless you f
 
 If you installed manually (or want to check), add/confirm that block yourself. Skip it with `./install.sh --no-claude-config`. Restart Claude Code so it picks up the new env.
 
-Other tools (Cursor, Codex, Aider, …) shell out to `rg`/`grep` on PATH, so they pick up shim automatically — it works with **any** provider (Anthropic, OpenRouter, DeepSeek, etc.) because it intercepts at the *tool* level, not the model.
+Other tools (Cursor, Codex, Aider, …) shell out to `rg` on PATH, so they pick up shim automatically — it works with **any** provider (Anthropic, OpenRouter, DeepSeek, etc.) because it intercepts at the *tool* level, not the model.
 
-**Verify:**
+**Verify:** open a new shell (or `exec $SHELL -l`) so the PATH change takes effect, then:
 
 ```bash
-which rg          # → /usr/local/bin/rg   (NOT /opt/homebrew/bin/rg)
+which rg          # → ~/.smart-rg/bin/rg   (NOT /opt/homebrew/bin/rg)
 smart-rg stats    # → the shim's stats dashboard (empty until you search — that's fine)
 ```
 
@@ -72,10 +71,6 @@ When shim redirects a search, you'll see a cyan message on stderr:
 ```
 
 No message = shim passed the search straight to real ripgrep (which is fine — some searches really are just text).
-
-### ⚠️ About intercepting `grep`
-
-`install.sh --with-grep` also points `grep` at the shim. Claude Code calls both `rg` and `grep`, so this widens coverage — **but** the shim speaks ripgrep's flag dialect, not classic `grep`'s, and the symlink shadows the system `grep` for *every* process on your machine. Scripts that rely on real `grep` semantics (`-P`, BRE/ERE, `-o` behavior) can misbehave. Leave it off unless you specifically need it; remove it any time with `sudo rm /usr/local/bin/grep`.
 
 ---
 
@@ -191,7 +186,7 @@ Two optional env vars:
 Every `rg` call is its own short-lived process, and they all log to the same `~/.smart-rg/stats.db`. That's fine: the DB uses **WAL + a 3s busy-timeout**, so concurrent agents wait-and-retry instead of dropping stats, and SQLite's file locking keeps the DB safe from corruption. Searches are never blocked or failed by logging — it's best-effort.
 
 - **Tell agents apart:** give each instance a distinct `SMART_RG_AGENT` (e.g. `claude-A`, `claude-B`) and the report's per-agent breakdown separates them.
-- **Sub-agents & restarts:** anything that inherits the PATH + `USE_BUILTIN_RIPGREP=0` (spawned sub-agents, new shells, after a `cd` or restart) is intercepted automatically — which is why the system-wide `/usr/local/bin` install matters for full coverage.
+- **Sub-agents & restarts:** anything that inherits the PATH + `USE_BUILTIN_RIPGREP=0` (spawned sub-agents, new shells, after a `cd` or restart) is intercepted automatically — the dedicated `~/.smart-rg/bin` and its `env.sh` PATH drop-in are sourced by every new shell, so coverage carries across restarts and sub-shells.
 - **Retention** is off the hot path: events older than 30 days are pruned lazily on `stats`/`report`, or on demand with `smart-rg prune`. (Comparisons are kept — they hold the savings data.)
 
 ---
@@ -212,47 +207,44 @@ See [Quick Start](#quick-start) for the simple version. `install.sh` installs th
 { "env": { "USE_BUILTIN_RIPGREP": "0" } }
 ```
 
-For broader coverage you *can* also intercept `grep` (`./install.sh --with-grep`), but read the [grep warning](#️-about-intercepting-grep) first.
-
 ### Cursor, Codex, Copilot CLI, Aider, …
 
-Any tool that shells out to `rg` works automatically — just make sure `/usr/local/bin` (where shim lives) comes before the system binaries in PATH. It intercepts at the tool level, not the model, so it works with **any** provider.
+Any tool that shells out to `rg` works automatically — the installer puts `~/.smart-rg/bin` (where shim lives) first on PATH, ahead of the system binaries. It intercepts at the tool level, not the model, so it works with **any** provider.
 
 ### Docker & containerized environments
 
-Tools that run inside containers/sandboxes have their own PATH and won't see your host's shim. Install it inside:
+Tools that run inside containers/sandboxes have their own PATH and won't see your host's shim. Install it inside — copy the shim binary onto a directory that's on the container's PATH and symlink `rg` to it (inside a container `/usr/local/bin` is fine; it's not your host):
 
 ```dockerfile
-COPY smart-rg /usr/local/bin/
+COPY smart-rg /usr/local/bin/smart-rg
 RUN ln -sf /usr/local/bin/smart-rg /usr/local/bin/rg
 ```
 
-Same idea for devcontainers, CI runners, or any sandbox — get the binary onto the container's PATH.
+Same idea for devcontainers, CI runners, or any sandbox — get the binary onto the container's PATH and point `rg` at it.
 
 ### Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| `which rg` shows `/opt/homebrew/bin/rg` | Another `rg` is ahead of the shim on PATH. The installer auto-fixes this (symlinks `rg` into the first writable dir already ahead of Homebrew, e.g. `~/.local/bin`, else prepends `/usr/local/bin` to your shell profile). Run `hash -r` (or open a new terminal) and re-check. To redo by hand: `ln -sf /usr/local/bin/smart-rg ~/.local/bin/rg && hash -r`. Disable the auto-fix with `--no-fix-path`. |
+| `which rg` shows `/opt/homebrew/bin/rg` | Another `rg` is ahead of the shim on PATH. Re-run `./install.sh` — it forces `~/.smart-rg/bin` to the front of PATH via `env.sh` — then `exec $SHELL -l` (or open a new terminal) and re-check. |
 | Searches work but `smart-rg stats` is empty | You're hitting real `rg` (PATH issue above), **or** Claude Code is using its bundled rg — set `USE_BUILTIN_RIPGREP=0`. |
 | Structural searches all fall through to text | `ast-grep` isn't on PATH. `which ast-grep`; `brew install ast-grep`. |
-| Worked, then stopped after restarting the AI tool | You installed to `~/bin`. Use `/usr/local/bin` (universal PATH for all processes). |
-| Ordinary `grep` started behaving weirdly | You used `--with-grep`. Remove it: `sudo rm /usr/local/bin/grep`. |
+| Worked, then stopped after restarting the AI tool | The new process didn't pick up the PATH drop-in. Open a fresh shell (or `exec $SHELL -l`); if it persists, re-run `./install.sh` to re-add the shell block. |
 | **Roll back everything** | `./install.sh --uninstall` (see below). Back to stock. |
 
 ---
 
 ## Updating & uninstalling
 
-smart-rg keeps things tidy: it **owns exactly one directory — `~/.smart-rg/`** (your stats DB + an install *manifest*). Everything else it places (the `/usr/local/bin` binary, the `rg`/`grep` symlinks, the PATH line) is recorded in that manifest.
+smart-rg keeps things tidy: it **owns exactly one directory — `~/.smart-rg/`**, holding `bin/{rg,rg2,smart-rg}`, the `env.sh` PATH drop-in, and your `stats.db`. There's no manifest — cleanup works by stripping the marked shell block (`# >>> smart-rg >>>` … `# <<< smart-rg <<<`) and removing that one directory.
 
-- **Update:** just re-run the install (`git pull && ./install.sh`, or the `curl … | bash` one-liner). It reads the previous manifest, **removes any superseded files** (old layouts, a `grep` link you dropped, the pre-`/usr/local/bin` `~/bin` setup), reinstalls, and writes a fresh manifest — so updates don't leave orphans behind.
+- **Update:** just re-run the install (`git pull && ./install.sh`, or the `curl … | bash` one-liner). It's idempotent: it strips any legacy or duplicate shell blocks and re-adds one clean block, and it migrates old layouts — removing any stale shim/command an older installer left in `/usr/local/bin` or a user PATH dir (e.g. `~/.local/bin/rg`, `~/bin/rg`). No orphans across upgrades.
 - **Uninstall:**
   ```bash
-  ./install.sh --uninstall            # remove binary, symlinks, and PATH lines (keeps your stats)
-  ./install.sh --uninstall --purge    # also delete ~/.smart-rg (stats + manifest)
+  ./install.sh --uninstall            # remove bin/{rg,rg2,smart-rg}, env.sh, and the shell blocks (keeps your stats DB)
+  ./install.sh --uninstall --purge    # also delete ~/.smart-rg/stats.db (and WAL sidecars) — removes ~/.smart-rg entirely
   ```
-  It only removes files that are unmistakably ours (symlinks pointing at a smart-rg binary; never your real `rg`/`grep`). No clone handy? `curl -fsSL https://raw.githubusercontent.com/PKM-M84/shim-/main/install.sh | bash -s -- --uninstall`.
+  It only removes files that are unmistakably ours (a symlink pointing at smart-rg, or a binary carrying the `smart-rg:` signature); never your real `rg`. No clone handy? `curl -fsSL https://raw.githubusercontent.com/PKM-M84/shim-/main/install.sh | bash -s -- --uninstall`.
 
 ---
 
@@ -342,7 +334,7 @@ Redirection adds ~40ms (ast-grep's JSON output is larger). For the token savings
 - [ ] Advanced classification: decorators, type annotations, JSX
 - [ ] Output streaming instead of buffering ast-grep results
 - [ ] Language auto-detection from file extensions when `--type` is omitted
-- [ ] `smart-rg install` / `doctor` subcommands (self-installer, replaces the manual symlink dance)
+- [x] Self-installer to a dedicated `~/.smart-rg/bin` with automatic PATH setup and self-verify (no manual symlink dance)
 - [ ] Homebrew formula
 
 ---

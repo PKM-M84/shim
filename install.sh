@@ -146,26 +146,32 @@ resolve_real_rg() {
 }
 
 # ── migrate away old shims that would shadow the new dedicated dir ─────────────
-# Pre-0.3 installs put the shim at /usr/local/bin/rg (symlink → /usr/local/bin/
-# smart-rg) and sometimes ~/.local/bin/rg. Remove ONLY if unmistakably ours.
+# Pre-0.3 installs put a `rg`/`grep` symlink or a `smart-rg` binary in
+# /usr/local/bin, and the old PATH-fix could drop a `rg` symlink into ANY
+# user-writable dir that was ahead of Homebrew on PATH (commonly ~/.local/bin or
+# ~/bin). So we don't probe a fixed list — we scan every PATH dir plus those
+# well-known legacy spots and remove anything OUTSIDE the dedicated bin that is
+# unmistakably OURS (a symlink → smart-rg, or a binary with the "smart-rg:"
+# signature). Real rg/grep are never flagged, so upgrades leave no orphans behind.
 migrate_old_shim() {
-    local old
-    # symlinks pointing at a smart-rg target
-    for old in /usr/local/bin/rg /usr/local/bin/grep "$REAL_HOME/.local/bin/rg"; do
-        [ -L "$old" ] || continue
-        case "$(readlink "$old" 2>/dev/null || true)" in
-            *smart-rg*) need_root rm -f "$old" 2>/dev/null || rm -f "$old"; echo "  removed old shim symlink $old" ;;
-        esac
+    local d f p cands seen
+    IFS=: read -ra cands <<< "$PATH"
+    cands+=( /usr/local/bin "$REAL_HOME/.local/bin" "$REAL_HOME/bin" )
+    seen=" "
+    for d in "${cands[@]}"; do
+        [ -n "$d" ] || continue
+        case "$seen" in *" $d "*) continue ;; esac   # dedupe PATH entries
+        seen="$seen$d "
+        [ "$d" = "$SRG_BIN" ] && continue             # never touch the new dir
+        for f in rg grep smart-rg; do
+            p="$d/$f"
+            { [ -e "$p" ] || [ -L "$p" ]; } || continue   # exists or dangling symlink
+            if is_smart_rg_shim "$p"; then
+                need_root rm -f "$p" 2>/dev/null || rm -f "$p"
+                echo "  removed old shim/command $p"
+            fi
+        done
     done
-    # the old shim binary itself
-    if [ -f /usr/local/bin/smart-rg ]; then
-        need_root rm -f /usr/local/bin/smart-rg 2>/dev/null || rm -f /usr/local/bin/smart-rg
-        echo "  removed old shim binary /usr/local/bin/smart-rg"
-    fi
-    # a regular-file shim copy at ~/.local/bin/rg (its binary embeds "smart-rg:")
-    if [ -f "$REAL_HOME/.local/bin/rg" ] && grep -aq "smart-rg:" "$REAL_HOME/.local/bin/rg" 2>/dev/null; then
-        rm -f "$REAL_HOME/.local/bin/rg"; echo "  removed old shim $REAL_HOME/.local/bin/rg"
-    fi
     # legacy manifest is obsolete in the new model
     rm -f "$SRG_HOME/manifest" 2>/dev/null || true
     return 0
@@ -256,7 +262,11 @@ fi
 # ── self-verify ───────────────────────────────────────────────────────────────
 # Probe a fresh shell with a SANITIZED PATH, so we measure what the startup files
 # do (not what the installer's own PATH happened to contain).
-probe()   { PATH="/usr/bin:/bin" "$@" -c 'command -v rg' 2>/dev/null || true; }
+# Extract ONLY the resolved rg path (a line ending in /rg). Startup files often
+# print their own noise (oh-my-zsh, powerlevel10k, MOTD, session-restore) before
+# the `-c` command runs; without this filter that noise contaminates the result
+# and the verify falsely FAILs even when rg resolves correctly.
+probe()   { PATH="/usr/bin:/bin" "$@" -c 'command -v rg' 2>/dev/null | grep -E '/rg$' | tail -n1 || true; }
 in_shim() { case "$1" in "$SRG_BIN"/*) return 0 ;; *) return 1 ;; esac; }
 
 self_verify() {

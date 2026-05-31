@@ -5,6 +5,30 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-05-31
+
+### Fixed
+
+- **Upgrades now clean up shim artifacts from *any* prior install location.**
+  `migrate_old_shim` previously probed only a couple of fixed paths
+  (`/usr/local/bin/rg`, `~/.local/bin/rg`). But older installers' PATH-fix could
+  drop a `rg` symlink into any user-writable dir ahead of Homebrew (e.g. `~/bin`),
+  leaving an orphan after upgrade. It now scans every PATH dir plus the
+  well-known legacy spots and removes anything outside the dedicated bin that is
+  unmistakably ours (symlink → smart-rg, or the `smart-rg:` binary signature).
+- **`self-verify` no longer falsely FAILs when your shell startup prints output.**
+  The probe captured the shell's entire `-c` output, so any banner from
+  oh-my-zsh / powerlevel10k / MOTD / session-restore contaminated the result and
+  the verify reported FAIL even though `rg` resolved correctly. It now extracts
+  just the resolved `rg` path.
+
+### Docs
+
+- README rewritten for the v0.3 dedicated-bin model: no `sudo` / `/usr/local/bin`,
+  the `~/.smart-rg/bin` + `env.sh` PATH drop-in, the `smart-rg` command, the
+  `--uninstall`/`--purge` flow, and removal of the obsolete `--with-grep` /
+  `--no-fix-path` / manifest references.
+
 ## [0.3.1] - 2026-05-31
 
 ### Fixed
