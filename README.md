@@ -4,6 +4,16 @@
 
 ---
 
+## Platform support & what's next
+
+**Supported today — macOS.** Prebuilt binaries for Apple Silicon (`arm64`) and Intel (`x86_64`); the installer auto-picks the right one. Linux works too, but it **builds from source** (bash/zsh) — there's no prebuilt Linux binary in the releases yet.
+
+> ⚠️ **No Windows support yet.** There is no Windows build, and the installer targets bash/zsh (not PowerShell/cmd). On Windows, use **WSL2** (a Linux environment) and follow the Linux-from-source path, or wait for native support.
+
+**What's next:** native **Windows** support is the next thing on our list, followed by prebuilt Linux binaries. See the full [Roadmap](#roadmap) below.
+
+---
+
 ## Quick Start
 
 ### What does this do?
@@ -238,7 +248,16 @@ Same idea for devcontainers, CI runners, or any sandbox — get the binary onto 
 
 smart-rg keeps things tidy: it **owns exactly one directory — `~/.smart-rg/`**, holding `bin/{rg,rg2,smart-rg}`, the `env.sh` PATH drop-in, and your `stats.db`. There's no manifest — cleanup works by stripping the marked shell block (`# >>> smart-rg >>>` … `# <<< smart-rg <<<`) and removing that one directory.
 
-- **Update:** just re-run the install (`git pull && ./install.sh`, or the `curl … | bash` one-liner). It's idempotent: it strips any legacy or duplicate shell blocks and re-adds one clean block, and it migrates old layouts — removing any stale shim/command an older installer left in `/usr/local/bin` or a user PATH dir (e.g. `~/.local/bin/rg`, `~/bin/rg`). No orphans across upgrades.
+- **Preview first (recommended when a previous version is already installed):** dry-run the installer to see what it *would* do — which dependencies it'd install, what it detects on your system — **without changing anything**:
+  ```bash
+  ./install.sh --check
+  # or, no clone:  curl -fsSL https://raw.githubusercontent.com/PKM-M84/shim-/main/install.sh | bash -s -- --check
+  ```
+  Run this before an update so there are no surprises about what the installer will migrate or clean on your specific setup.
+- **Update:** just re-run the install (`git pull && ./install.sh`, or the `curl … | bash` one-liner). It's idempotent: it strips any legacy or duplicate shell blocks and re-adds one clean block, and it migrates old layouts — removing any stale shim/command an older installer left in `/usr/local/bin` or a user PATH dir (e.g. `~/.local/bin/rg`, `~/bin/rg`). **Your `stats.db` is preserved** across updates. No orphans across upgrades.
+- **After updating — two quick steps:**
+  1. The PATH change only applies to *new* shells. Run `exec $SHELL -l` (or open a new terminal), then confirm: `which rg` → `~/.smart-rg/bin/rg`, and `smart-rg stats` works.
+  2. **Restart Claude Code** (or whatever agent you use) so it re-reads `USE_BUILTIN_RIPGREP=0` and starts calling the refreshed shim. Without a restart, a long-running agent keeps using the old process.
 - **Uninstall:**
   ```bash
   ./install.sh --uninstall            # remove bin/{rg,rg2,smart-rg}, env.sh, and the shell blocks (keeps your stats DB)
@@ -330,6 +349,8 @@ Redirection adds ~40ms (ast-grep's JSON output is larger). For the token savings
 
 ## Roadmap
 
+- [ ] **Native Windows support** (PowerShell/cmd installer + Windows binary) — *next up*
+- [ ] Prebuilt Linux binaries in releases (currently Linux builds from source)
 - [ ] Flag translation: `-A`, `-B`, `-C`, `--glob` in ast-grep mode
 - [ ] Advanced classification: decorators, type annotations, JSX
 - [ ] Output streaming instead of buffering ast-grep results
