@@ -5,6 +5,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] - 2026-05-31
+
+### Changed
+
+- **`smart-rg --help` now shows smart-rg's own help** — its subcommands
+  (`stats`, `report`, `prune`, `reset`), drop-in search usage, and install
+  management — instead of forwarding to ripgrep's multi-page `--help`. A bare
+  `smart-rg` and `smart-rg help` show the same help. When the binary is invoked
+  as `rg` (impersonating ripgrep), `rg --help` still forwards to the real
+  ripgrep, so the `rg` contract is unchanged. Help text credits ripgrep and
+  ast-grep and points power users to `rg --help` for the full flag list.
+
 ## [0.3.2] - 2026-05-31
 
 ### Fixed

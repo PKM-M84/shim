@@ -91,7 +91,7 @@ fn ensure_home() {
 // ── CLI ──────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
-#[command(name = "smart-rg", version = "0.3.2")]
+#[command(name = "smart-rg", version = "0.3.3")]
 #[command(disable_help_flag = true)]
 struct Cli {
     #[command(subcommand)]
@@ -173,6 +173,45 @@ enum Commands {
 
 // ── Main ─────────────────────────────────────────────────────
 
+// Human-facing help for the `smart-rg` management command. (Invoked as `rg`,
+// --help is forwarded to real ripgrep instead — see main.) Version comes from
+// Cargo.toml at compile time so it never drifts.
+fn print_shim_help() {
+    let v = env!("CARGO_PKG_VERSION");
+    println!("\
+smart-rg {v} — a drop-in ripgrep shim that redirects structural code
+searches to ast-grep and logs the files, tokens, and cost it saves.
+
+USAGE:
+  smart-rg <pattern> [rg flags] [path]    search (drop-in for `rg`)
+  smart-rg <command> [options]            manage stats & reports
+
+COMMANDS:
+  stats [--json]              show interception stats in the terminal
+  report [-o FILE] [--open]   write a self-contained HTML savings report
+  prune [--days N]            delete logged events older than N days (default 30)
+  reset --yes                 wipe ALL stats (events + comparisons)
+  help                        show this help
+
+SEARCH (used as `rg`):
+  Accepts ripgrep's flags (-n, -l, -i, -c, --type, -C, -g, …) and prints the
+  same file:line:content output. Structural patterns are routed to ast-grep;
+  plain-text searches pass through to real ripgrep.
+  For the full ripgrep flag reference:  rg --help
+
+MANAGE THE INSTALL (install.sh):
+  ./install.sh --check        dry-run: show what an install/update would do
+  ./install.sh                install or update (idempotent, no sudo)
+  ./install.sh --uninstall    remove smart-rg (keeps stats; add --purge to wipe)
+
+EXAMPLES:
+  smart-rg 'useState(' --type ts ./src
+  smart-rg report -o report.html --open
+  smart-rg stats
+
+Stats live in ~/.smart-rg/stats.db. Built on ripgrep and ast-grep.");
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -230,6 +269,21 @@ fn main() {
             }
             _ => {}
         }
+    }
+
+    // Help. Invoked as `smart-rg`, show OUR help (subcommands + drop-in usage).
+    // Invoked as `rg`, forward --help to real ripgrep so anything probing the
+    // `rg` contract still sees ripgrep's own help. A bare `smart-rg` shows help;
+    // a bare `rg` still passes through.
+    let invoked_as_smart_rg = std::env::args().next()
+        .map(|a0| std::path::Path::new(&a0).file_name()
+            .map(|f| f.to_string_lossy() == "smart-rg").unwrap_or(false))
+        .unwrap_or(false);
+    let wants_help = args.iter().any(|a| a == "--help" || a == "-h")
+        || args.get(1).map(|a| a == "help").unwrap_or(false);
+    if invoked_as_smart_rg && (wants_help || args.len() <= 1) {
+        print_shim_help();
+        return;
     }
 
     // Passthrough modes: no args, --help, -h
