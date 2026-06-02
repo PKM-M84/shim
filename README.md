@@ -170,6 +170,10 @@ No agent consent required. No model retraining. Just: `USE_BUILTIN_RIPGREP=0` an
 
 ## Stats & Reports
 
+[![smart-rg HTML savings report — files, tokens, and cost saved per pattern](docs/report-preview.png)](docs/report-preview.png)
+
+> `smart-rg report -o report.html --open` — a self-contained HTML dashboard of **real** rg-vs-ast-grep savings.
+
 shim logs every search to a local SQLite database (`~/.smart-rg/stats.db`, created automatically) and turns it into savings numbers.
 
 ```bash
