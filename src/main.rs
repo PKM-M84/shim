@@ -91,7 +91,7 @@ fn ensure_home() {
 // ── CLI ──────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
-#[command(name = "smart-rg", version = "0.3.3")]
+#[command(name = "smart-rg", version = "0.3.4")]
 #[command(disable_help_flag = true)]
 struct Cli {
     #[command(subcommand)]
@@ -297,7 +297,11 @@ fn main() {
             let maybe_pattern = args.iter().skip(1)
                 .find(|a| !a.starts_with('-') && !a.starts_with("--"));
             if let Some(pat) = maybe_pattern {
-                log_event("parse_error", pat, "clap_failed", None, 0);
+                // clap couldn't parse these rg flags, but we still forward to real
+                // rg below — so this is a passthrough, NOT an error. Logging it as
+                // an error mislabels ordinary rg searches (regex alternations, char
+                // classes, paths) and inflates the report's error count.
+                log_event("passthrough", pat, "clap_unparsed", None, 0);
             }
             exec_real_rg(&args[1..]);
         }
@@ -728,9 +732,18 @@ fn run_ast_grep(sg_pattern: &str, lang: &str, path: &str, cli: &Cli) -> u64 {
     let ag_time_ms = ag_start.elapsed().as_millis() as u64;
 
     if !output.status.success() {
+        // ast-grep exits 1 on "no matches" — that is the normal empty-result case,
+        // not a failure, and it writes nothing to stderr. A genuine failure (bad
+        // path, unreadable file/stream, internal error) writes to stderr. Only the
+        // latter is a real error: log it AND fall back to real rg so the user still
+        // gets results instead of a silent empty answer.
         let stderr = String::from_utf8_lossy(&output.stderr);
-        log_event("ast_grep_error", sg_pattern,
-            &format!("exit_{}_stderr_{}", output.status, stderr.trim()), Some(lang), 0);
+        if !stderr.trim().is_empty() {
+            log_event("ast_grep_error", sg_pattern,
+                &format!("exit_{}_stderr_{}", output.status, stderr.trim()), Some(lang), 0);
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            exec_real_rg(&args);
+        }
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
