@@ -21,7 +21,7 @@
 
 set -e
 
-REPO="PKM-M84/shim-"
+REPO="PKM-M84/shim"
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 # Run user-space tools (brew, rustup, cargo) as the REAL user even under sudo.

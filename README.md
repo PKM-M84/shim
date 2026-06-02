@@ -29,7 +29,7 @@ You don't need anything pre-installed, and you don't need `sudo`. `install.sh` *
 **Option A — fastest (no Rust, no clone): grab the prebuilt binary**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/PKM-M84/shim-/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/PKM-M84/shim/main/install.sh | bash
 ```
 
 Installs ast-grep + ripgrep (via Homebrew if present), downloads the prebuilt shim binary for your Mac (Apple Silicon or Intel) to `~/.smart-rg/bin/rg`, puts that directory first on your PATH (via a shell drop-in), and configures Claude Code. No Rust required.
@@ -37,8 +37,8 @@ Installs ast-grep + ripgrep (via Homebrew if present), downloads the prebuilt sh
 **Option B — from source (auto-installs Rust if needed):**
 
 ```bash
-git clone https://github.com/PKM-M84/shim-.git
-cd shim-
+git clone https://github.com/PKM-M84/shim.git
+cd shim
 ./install.sh          # checks deps, installs Rust if missing, builds, installs
 ```
 
@@ -255,7 +255,7 @@ smart-rg keeps things tidy: it **owns exactly one directory — `~/.smart-rg/`**
 - **Preview first (recommended when a previous version is already installed):** dry-run the installer to see what it *would* do — which dependencies it'd install, what it detects on your system — **without changing anything**:
   ```bash
   ./install.sh --check
-  # or, no clone:  curl -fsSL https://raw.githubusercontent.com/PKM-M84/shim-/main/install.sh | bash -s -- --check
+  # or, no clone:  curl -fsSL https://raw.githubusercontent.com/PKM-M84/shim/main/install.sh | bash -s -- --check
   ```
   Run this before an update so there are no surprises about what the installer will migrate or clean on your specific setup.
 - **Update:** just re-run the install (`git pull && ./install.sh`, or the `curl … | bash` one-liner). It's idempotent: it strips any legacy or duplicate shell blocks and re-adds one clean block, and it migrates old layouts — removing any stale shim/command an older installer left in `/usr/local/bin` or a user PATH dir (e.g. `~/.local/bin/rg`, `~/bin/rg`). **Your `stats.db` is preserved** across updates. No orphans across upgrades.
@@ -267,7 +267,7 @@ smart-rg keeps things tidy: it **owns exactly one directory — `~/.smart-rg/`**
   ./install.sh --uninstall            # remove bin/{rg,rg2,smart-rg}, env.sh, and the shell blocks (keeps your stats DB)
   ./install.sh --uninstall --purge    # also delete ~/.smart-rg/stats.db (and WAL sidecars) — removes ~/.smart-rg entirely
   ```
-  It only removes files that are unmistakably ours (a symlink pointing at smart-rg, or a binary carrying the `smart-rg:` signature); never your real `rg`. No clone handy? `curl -fsSL https://raw.githubusercontent.com/PKM-M84/shim-/main/install.sh | bash -s -- --uninstall`.
+  It only removes files that are unmistakably ours (a symlink pointing at smart-rg, or a binary carrying the `smart-rg:` signature); never your real `rg`. No clone handy? `curl -fsSL https://raw.githubusercontent.com/PKM-M84/shim/main/install.sh | bash -s -- --uninstall`.
 
 ---
 
