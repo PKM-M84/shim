@@ -2,6 +2,14 @@
 
 > Drop-in `rg` replacement that silently redirects structural code searches to ast-grep — and tracks how many files, tokens, and dollars it saves you. Saves 50–90% of search tokens. ~2MB binary, bundled SQLite, zero config.
 
+> ## 🖥️ Works with terminal CLI agents only — not the desktop or web app
+>
+> shim intercepts `rg` calls from agents running **locally in your terminal**: **Claude Code (CLI)**, Cursor CLI, Codex, Aider, and the like. PATH + `USE_BUILTIN_RIPGREP=0` route their `rg` through the shim.
+>
+> It **cannot** see the **Claude desktop app** or **claude.ai (web)**. Those run in the cloud with no access to your filesystem — they never execute your local ripgrep, so there is **nothing to intercept**. This is a hard boundary of how a local `rg` shim works, **not a bug and not fixable** by any PATH/install trick.
+>
+> **Want your searches measured? Run your agent from a terminal.** Desktop/web usage will never appear in `smart-rg stats`.
+
 ---
 
 ## Platform support & what's next
