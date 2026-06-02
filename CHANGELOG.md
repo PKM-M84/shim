@@ -5,6 +5,33 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.4] - 2026-06-01
+
+### Fixed
+
+- **ast-grep "no matches" is no longer logged as an error.** ast-grep exits `1`
+  when a pattern matches nothing — the normal empty-result case. The runner
+  treated any non-zero exit as a failure, so every empty structural search was
+  recorded as an `ast_grep_error` (and produced a duplicate `structural/0` event).
+  A real failure is now distinguished by **non-empty stderr** (e.g. a bad path /
+  unreadable stream); only those are logged as errors.
+- **Genuine ast-grep failures now fall back to real ripgrep.** Previously a real
+  error (e.g. `stream: No such file or directory`) was logged and then returned a
+  silent empty result. The runner now forwards to real `rg` so the user always
+  gets results.
+- **Unparseable rg invocations are counted as passthroughs, not errors.** When
+  `clap` cannot parse an `rg` flag combination the shim still forwards to real rg,
+  so the event is a `passthrough` (`clap_unparsed`), not a `parse_error`. This
+  stops ordinary regex searches (alternations, char classes, paths) from
+  inflating the report's error count.
+
+### Note
+
+- The HTML report is built **only** from real intercepted searches. If an older
+  `~/.smart-rg/stats.db` contains seeded benchmark `comparisons` rows, wipe them
+  with `smart-rg reset --yes` (or delete just those rows) so the report reflects
+  actual usage.
+
 ## [0.3.3] - 2026-05-31
 
 ### Changed
