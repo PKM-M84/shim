@@ -91,7 +91,7 @@ fn ensure_home() {
 // ── CLI ──────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
-#[command(name = "smart-rg", version = "0.3.4")]
+#[command(name = "smart-rg", version = "0.3.5")]
 #[command(disable_help_flag = true)]
 struct Cli {
     #[command(subcommand)]
@@ -139,6 +139,107 @@ struct Cli {
 
     #[arg(long = "hidden")]
     hidden: bool,
+
+    /// Explicit pattern (same as positional PATTERN; rg's -e flag)
+    #[arg(short = 'e', long = "regexp")]
+    regexp: Option<String>,
+
+    /// Suppress filenames in output
+    #[arg(short = 'H', long = "with-filename")]
+    with_filename: bool,
+
+    #[arg(long = "no-filename")]
+    no_filename: bool,
+
+    #[arg(long = "heading")]
+    heading: bool,
+
+    #[arg(long = "no-heading")]
+    no_heading: bool,
+
+    /// Don't use ignore files (.gitignore, etc.)
+    #[arg(long = "no-ignore")]
+    no_ignore: bool,
+
+    #[arg(long = "no-ignore-dot")]
+    no_ignore_dot: bool,
+
+    #[arg(long = "no-ignore-global")]
+    no_ignore_global: bool,
+
+    #[arg(long = "no-ignore-parent")]
+    no_ignore_parent: bool,
+
+    #[arg(long = "no-ignore-vcs")]
+    no_ignore_vcs: bool,
+
+    /// Match whole words only
+    #[arg(short = 'w', long = "word-regexp")]
+    word_regexp: bool,
+
+    /// Treat pattern as literal string
+    #[arg(short = 'F', long = "fixed-strings")]
+    fixed_strings: bool,
+
+    /// Enable PCRE2 regex engine
+    #[arg(long = "pcre2")]
+    pcre2: bool,
+
+    /// Enable multiline mode
+    #[arg(short = 'U', long = "multiline")]
+    multiline: bool,
+
+    /// Follow symlinks
+    #[arg(short = 'L', long = "follow")]
+    follow: bool,
+
+    /// Print NUL byte after each filename
+    #[arg(long = "null")]
+    null: bool,
+
+    /// Strip whitespace from matches
+    #[arg(long = "trim")]
+    trim: bool,
+
+    /// Print only filenames without matches
+    #[arg(long = "files-without-match")]
+    files_without_match: bool,
+
+    /// Print only the matched part
+    #[arg(short = 'o', long = "only-matching")]
+    only_matching: bool,
+
+    /// Only search N files
+    #[arg(short = 'm', long = "max-count")]
+    max_count: Option<String>,
+
+    /// Limit directory recursion depth
+    #[arg(long = "max-depth")]
+    max_depth: Option<String>,
+
+    /// Limit file size
+    #[arg(long = "max-filesize")]
+    max_filesize: Option<String>,
+
+    /// Sort results by field
+    #[arg(long = "sort")]
+    sort: Option<String>,
+
+    /// Sort results in reverse by field
+    #[arg(long = "sortr")]
+    sortr: Option<String>,
+
+    /// When to use colors
+    #[arg(long = "color")]
+    color: Option<String>,
+
+    /// Number of threads
+    #[arg(short = 'j', long = "threads")]
+    threads: Option<String>,
+
+    /// Field separator
+    #[arg(long = "field-match-separator")]
+    field_match_separator: Option<String>,
 
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     extra: Vec<String>,
@@ -294,28 +395,80 @@ fn main() {
     let cli = match Cli::try_parse_from(args.iter()) {
         Ok(c) => c,
         Err(_) => {
-            let maybe_pattern = args.iter().skip(1)
-                .find(|a| !a.starts_with('-') && !a.starts_with("--"));
+            // clap couldn't parse these rg flags, but we still forward to real rg.
+            // Try to extract the real search pattern so we at least log something
+            // meaningful (not glob values like "!.git" or context counts like "4").
+            // Strategy: check for -e/--regexp first, then skip known flag-value pairs
+            // and path-looking positionals, then take the first remaining non-flag arg.
+            let flags_with_values = [
+                "-e", "--regexp", "-t", "--type", "-g", "--glob",
+                "--color", "--sort", "--sortr", "-m", "--max-count",
+                "--max-depth", "--max-filesize", "-B", "--before-context",
+                "-A", "--after-context", "-C", "--context",
+                "-j", "--threads", "--field-match-separator",
+            ];
+            let mut maybe_pattern: Option<&str> = None;
+            let mut skip_next = false;
+            let mut found_regexp = false;
+            let mut i = 1usize;
+            while i < args.len() {
+                let arg = args[i].as_str();
+                if skip_next {
+                    // Check if this was after -e/--regexp — if so, it IS the pattern
+                    if found_regexp {
+                        maybe_pattern = Some(arg);
+                        break;
+                    }
+                    skip_next = false;
+                    found_regexp = false;
+                    i += 1;
+                    continue;
+                }
+                if arg == "-e" || arg == "--regexp" {
+                    skip_next = true;
+                    found_regexp = true;
+                    i += 1;
+                    continue;
+                }
+                if flags_with_values.contains(&arg) {
+                    skip_next = true;
+                    i += 1;
+                    continue;
+                }
+                if arg.starts_with('-') {
+                    i += 1;
+                    continue;
+                }
+                // Non-flag: skip if it looks like a path or count
+                if arg.starts_with('/') || arg == "." || arg == ".."
+                    || arg.parse::<u64>().is_ok()
+                    || arg.starts_with("!.")  // glob exclusion like !.git
+                {
+                    i += 1;
+                    continue;
+                }
+                maybe_pattern = Some(arg);
+                break;
+            }
             if let Some(pat) = maybe_pattern {
-                // clap couldn't parse these rg flags, but we still forward to real
-                // rg below — so this is a passthrough, NOT an error. Logging it as
-                // an error mislabels ordinary rg searches (regex alternations, char
-                // classes, paths) and inflates the report's error count.
                 log_event("passthrough", pat, "clap_unparsed", None, 0);
             }
             exec_real_rg(&args[1..]);
         }
     };
 
-    let pattern = match &cli.pattern {
+    let pattern = match cli.regexp.as_ref().or(cli.pattern.as_ref()) {
         Some(p) => p.clone(),
         None => {
             exec_real_rg(&args[1..]);
         }
     };
 
-    let lang = map_lang(&cli.file_type);
+    let lang_from_type = map_lang(&cli.file_type);
     let is_structural = classify(&pattern);
+
+    // If no --type flag, try to infer language from the search path's file extensions.
+    let lang = lang_from_type.or_else(|| infer_lang_from_path(&cli.path));
 
     if !is_structural || lang.is_none() {
         let reason = if !is_structural { "not_structural" } else { "no_language" };
@@ -493,6 +646,64 @@ fn map_lang(file_type: &Option<String>) -> Option<&str> {
     }
 }
 
+// Infer the dominant language by counting file extensions under a path.
+// Only called when no --type flag was passed; returns None if path isn't a dir
+// or has no recognizable source files. Capped at a shallow scan (max_depth=2)
+// so it never blocks on large trees.
+fn infer_lang_from_path(path: &str) -> Option<&'static str> {
+    use std::collections::HashMap;
+    let base = std::path::Path::new(path);
+    if !base.is_dir() {
+        // Single file — detect from extension directly.
+        return ext_to_lang(base.extension()?.to_str()?);
+    }
+
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    // Walk up to depth 2 to keep this cheap.
+    walk_for_lang(base, 0, &mut counts);
+
+    counts.into_iter().max_by_key(|(_, n)| *n).map(|(lang, _)| lang)
+}
+
+fn walk_for_lang(dir: &std::path::Path, depth: u32, counts: &mut std::collections::HashMap<&'static str, usize>) {
+    if depth > 2 { return; }
+    let rd = match std::fs::read_dir(dir) { Ok(r) => r, Err(_) => return };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.starts_with('.') || name == "node_modules" || name == "target" { continue; }
+            walk_for_lang(&p, depth + 1, counts);
+        } else if let Some(lang) = p.extension().and_then(|e| e.to_str()).and_then(ext_to_lang) {
+            *counts.entry(lang).or_insert(0) += 1;
+        }
+    }
+}
+
+fn ext_to_lang(ext: &str) -> Option<&'static str> {
+    match ext {
+        "ts" => Some("typescript"),
+        "tsx" => Some("tsx"),
+        "js" | "mjs" | "cjs" => Some("javascript"),
+        "jsx" => Some("jsx"),
+        "py" => Some("python"),
+        "rs" => Some("rust"),
+        "go" => Some("go"),
+        "rb" => Some("ruby"),
+        "java" => Some("java"),
+        "c" | "h" => Some("c"),
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" => Some("c"),
+        "css" => Some("css"),
+        "html" | "htm" => Some("html"),
+        "swift" => Some("swift"),
+        "kt" => Some("kotlin"),
+        "scala" => Some("scala"),
+        "php" => Some("php"),
+        "sh" | "bash" => Some("bash"),
+        _ => None,
+    }
+}
+
 // ── Classification ───────────────────────────────────────────
 
 fn classify(pattern: &str) -> bool {
@@ -524,9 +735,9 @@ fn classify(pattern: &str) -> bool {
         return false;
     }
 
-    // Function-call shorthand: "foo(" or "obj.method("
+    // Function-call: "foo(", "obj.method(", or full signature "fn foo($$$)"
     if raw.contains('(') && !raw.contains('|') && !raw.contains('[') {
-        return raw.ends_with('(') || raw.contains(".(");
+        return raw.ends_with('(') || raw.contains(".(") || raw.contains(')');
     }
 
     // Accept identifier-like forms OR any pattern with explicit structural operators

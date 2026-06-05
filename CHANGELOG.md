@@ -5,6 +5,39 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.5] - 2026-06-05
+
+### Fixed
+
+- **Added 30+ missing rg flags to the clap argument parser.** Claude Code calls
+  `rg` with flags like `--no-ignore`, `--sort`, `--no-heading`, `--color`,
+  `-H/--with-filename`, `-w`, `-F`, `-e/--regexp`, `-m/--max-count`, and others
+  that the old clap struct didn't recognize. Any unrecognized flag caused clap to
+  bail, the shim fell to the `clap_unparsed` path, and the pattern was never
+  extracted or classified. These flags now parse correctly, recovering ~393 events
+  per session that were previously lost as opaque passthroughs.
+
+- **`-e/--regexp` is now a first-class pattern flag.** When rg is called as
+  `rg -e 'pattern' --type ts .` the pattern is now correctly extracted from the
+  `-e` value rather than missed entirely.
+
+- **Classifier now recognises full function signatures.** Patterns with a closing
+  paren (e.g. `fn main($$$)`, `Command::new($$$)`) were rejected by the
+  function-call branch because only `pattern.ends_with('(')` was accepted. Any
+  pattern containing matching parens is now classified as structural.
+
+- **Improved fallback pattern extraction when clap still fails.** The previous
+  fallback picked the first non-flag argument, which was often a glob value
+  (`!.git`), a context count (`4`), or a path — not the actual search term. The
+  new extractor checks for `-e/--regexp` first, then skips known flag-value
+  pairs and path-looking positionals before selecting the real pattern.
+
+- **Language inference from path when no `--type` flag is given.** When a
+  structural pattern is found but no `--type/-t` flag was passed (a very common
+  Claude Code call shape), the shim now scans the search path (max depth 2,
+  skipping `node_modules`/`target`) and picks the dominant file-extension language.
+  This recovers `no_language` passthroughs for most real-project searches.
+
 ## [0.3.4] - 2026-06-01
 
 ### Fixed
