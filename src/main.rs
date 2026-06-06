@@ -606,11 +606,30 @@ fn infer_lang_from_path(path: &str) -> Option<&'static str> {
         return ext_to_lang(base.extension()?.to_str()?);
     }
 
-    let mut counts: HashMap<&str, usize> = HashMap::new();
+    let mut counts: HashMap<&'static str, usize> = HashMap::new();
     // Walk up to depth 2 to keep this cheap.
     walk_for_lang(base, 0, &mut counts);
 
-    counts.into_iter().max_by_key(|(_, n)| *n).map(|(lang, _)| lang)
+    dominant_lang(&counts)
+}
+
+// Choose the dominant language from extension counts. Two rules beyond "most
+// frequent wins": (1) a real programming language always beats markup/style
+// (html/css) — a stray `report.html` next to `main.rs` must not flip a Rust dir
+// to HTML; (2) ties resolve alphabetically so the result is deterministic (a
+// HashMap's iteration order is not).
+fn dominant_lang(counts: &std::collections::HashMap<&'static str, usize>) -> Option<&'static str> {
+    const MARKUP: &[&str] = &["html", "css"];
+    // Within a group, pick the highest count; break ties by the alphabetically
+    // smaller name (then.cmp reversed) so the choice is deterministic.
+    let best = |markup_group: bool| -> Option<&'static str> {
+        counts.iter()
+            .filter(|(lang, _)| MARKUP.contains(lang) == markup_group)
+            .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
+            .map(|(lang, _)| *lang)
+    };
+    // Programming languages first; fall back to markup only if none present.
+    best(false).or_else(|| best(true))
 }
 
 fn walk_for_lang(dir: &std::path::Path, depth: u32, counts: &mut std::collections::HashMap<&'static str, usize>) {
@@ -699,11 +718,30 @@ fn classify(pattern: &str) -> bool {
 
 // ── Pattern translation ──────────────────────────────────────
 
+// A pattern like `fn main(` / `function foo(` / `func Bar(` is a FUNCTION
+// DEFINITION, not a call. Translating it to a call form (`fn main($$$)`) matches
+// NOTHING — a body-less item isn't a complete node — and adding a body
+// (`fn main($$$) { $$$ }`) misses every function that has a return type, since
+// `-> T` / `: T` sits between the `)` and the `{`. The robust, language-uniform
+// form is the bare `keyword name` signature: ast-grep matches the whole function
+// item from its prefix regardless of return type or body (verified across Rust,
+// TS, Go). The keyword must be followed by a name, so bare `func(` is a CALL to
+// something *named* `func` and stays call-form.
+fn is_fn_definition(stripped: &str) -> bool {
+    let toks: Vec<&str> = stripped.split_whitespace().collect();
+    toks.iter().enumerate().any(|(i, t)| {
+        matches!(*t, "fn" | "function" | "func") && i + 1 < toks.len()
+    })
+}
+
 fn translate_pattern(pattern: &str) -> String {
     let raw: String = pattern.chars().filter(|&c| c != '\\').collect();
     let raw = raw.trim();
 
     if let Some(stripped) = raw.strip_suffix('(') {
+        if is_fn_definition(stripped) {
+            return stripped.to_string();
+        }
         return format!("{}($$$)", stripped);
     }
 
@@ -1525,5 +1563,81 @@ mod tests {
     fn only_flags_no_pattern() {
         let inv = parse(&["--version"]);
         assert_eq!(inv.pattern, None);
+    }
+
+    // ── translate_pattern: definitions need a body in brace languages ──
+
+    // A definition translates to the bare `keyword name` signature — NOT a
+    // paren/body form. ast-grep matches the whole function item from the signature
+    // prefix regardless of return type (`-> u64`, `: number`, `error`) or body,
+    // which a `name($$$) { $$$ }` pattern does NOT (it misses every fn with a
+    // return type). Bare-name is the form that's robust without per-language churn.
+    #[test]
+    fn rust_fn_definition_becomes_bare_signature() {
+        assert_eq!(translate_pattern("fn main("), "fn main");
+    }
+
+    #[test]
+    fn ts_function_definition_becomes_bare_signature() {
+        assert_eq!(translate_pattern("function useEffect("), "function useEffect");
+    }
+
+    #[test]
+    fn go_func_definition_becomes_bare_signature() {
+        assert_eq!(translate_pattern("func Handler("), "func Handler");
+    }
+
+    #[test]
+    fn rust_fn_with_modifiers_keeps_them() {
+        assert_eq!(translate_pattern("pub async fn run("), "pub async fn run");
+    }
+
+    #[test]
+    fn call_expressions_stay_call_form() {
+        assert_eq!(translate_pattern("useState("), "useState($$$)");
+        assert_eq!(translate_pattern("Command::new("), "Command::new($$$)");
+    }
+
+    #[test]
+    fn python_def_stays_paren_only_no_braces() {
+        // Python is not a brace language; ast-grep matches `def foo($$$)` directly.
+        assert_eq!(translate_pattern("def foo("), "def foo($$$)");
+    }
+
+    #[test]
+    fn call_to_thing_named_func_is_not_a_definition() {
+        // `func(` with no name after the keyword is a CALL, not a definition.
+        assert_eq!(translate_pattern("func("), "func($$$)");
+    }
+
+    // ── dominant_lang: programming beats markup, ties deterministic ──
+
+    fn counts(pairs: &[(&'static str, usize)]) -> std::collections::HashMap<&'static str, usize> {
+        pairs.iter().cloned().collect()
+    }
+
+    #[test]
+    fn programming_language_beats_markup() {
+        assert_eq!(dominant_lang(&counts(&[("rust", 1), ("html", 1)])), Some("rust"));
+    }
+
+    #[test]
+    fn markup_used_only_when_no_programming_language_present() {
+        assert_eq!(dominant_lang(&counts(&[("html", 2), ("css", 1)])), Some("html"));
+    }
+
+    #[test]
+    fn highest_count_wins_among_programming_languages() {
+        assert_eq!(dominant_lang(&counts(&[("rust", 3), ("python", 1)])), Some("rust"));
+    }
+
+    #[test]
+    fn ties_break_alphabetically_for_determinism() {
+        assert_eq!(dominant_lang(&counts(&[("go", 2), ("rust", 2)])), Some("go"));
+    }
+
+    #[test]
+    fn empty_counts_is_none() {
+        assert_eq!(dominant_lang(&counts(&[])), None);
     }
 }

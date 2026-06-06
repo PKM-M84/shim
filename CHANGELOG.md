@@ -5,6 +5,34 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.8] - 2026-06-06
+
+### Fixed — pattern translation & language inference (the last two redirect gaps)
+
+- **Function-definition searches now match.** `fn main(` was translated to the
+  call form `fn main($$$)`, which matches nothing (a body-less item isn't a
+  complete node). Adding a body (`fn main($$$) { $$$ }`) only matched functions
+  *without* a return type — every `fn …(…) -> T {` and `function …(): T {` was
+  still missed. A definition (`fn`/`function`/`func` keyword followed by a name)
+  now translates to the bare `keyword name` signature, which ast-grep matches
+  against the whole function item **regardless of return type or body** — verified
+  across Rust, TypeScript, and Go with no per-language churn. Calls (`useState(`,
+  `Command::new(`) and Python `def foo(` are unchanged.
+- **Language inference no longer flips on a stray asset file.** When no `--type`
+  was given, `infer_lang_from_path` counted extensions and took the mode via a
+  non-deterministic `HashMap` max — so a single `report.html` beside `main.rs`
+  could make a Rust directory infer as HTML. The choice is now deterministic and
+  **prefers a real programming language over markup/style (html/css)**, breaking
+  remaining ties alphabetically.
+- Both behaviours are covered by `cargo test` (bare-signature translation incl.
+  modifiers like `pub async fn`, call-form preservation, Python `def`, and the
+  programming-beats-markup / tie-break inference rules).
+
+### Known follow-ups
+
+- `fn foo` (bare) won't match `pub fn foo` if the user omits the modifier the
+  source uses — an inherent limit of matching by literal signature prefix.
+
 ## [0.3.7] - 2026-06-06
 
 ### Changed — flag-agnostic argument parsing (ends the "add more rg flags" churn)
