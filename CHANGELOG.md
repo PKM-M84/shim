@@ -5,6 +5,102 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.8] - 2026-06-06
+
+### Fixed — pattern translation & language inference (the last two redirect gaps)
+
+- **Function-definition searches now match.** `fn main(` was translated to the
+  call form `fn main($$$)`, which matches nothing (a body-less item isn't a
+  complete node). Adding a body (`fn main($$$) { $$$ }`) only matched functions
+  *without* a return type — every `fn …(…) -> T {` and `function …(): T {` was
+  still missed. A definition (`fn`/`function`/`func` keyword followed by a name)
+  now translates to the bare `keyword name` signature, which ast-grep matches
+  against the whole function item **regardless of return type or body** — verified
+  across Rust, TypeScript, and Go with no per-language churn. Calls (`useState(`,
+  `Command::new(`) and Python `def foo(` are unchanged.
+- **Language inference no longer flips on a stray asset file.** When no `--type`
+  was given, `infer_lang_from_path` counted extensions and took the mode via a
+  non-deterministic `HashMap` max — so a single `report.html` beside `main.rs`
+  could make a Rust directory infer as HTML. The choice is now deterministic and
+  **prefers a real programming language over markup/style (html/css)**, breaking
+  remaining ties alphabetically.
+- Both behaviours are covered by `cargo test` (bare-signature translation incl.
+  modifiers like `pub async fn`, call-form preservation, Python `def`, and the
+  programming-beats-markup / tie-break inference rules).
+
+### Known follow-ups
+
+- `fn foo` (bare) won't match `pub fn foo` if the user omits the modifier the
+  source uses — an inherent limit of matching by literal signature prefix.
+
+## [0.3.7] - 2026-06-06
+
+### Changed — flag-agnostic argument parsing (ends the "add more rg flags" churn)
+
+- **Replaced the clap-derive flag struct with a purpose-built extractor**
+  (`parse_rg_invocation`). The old struct had to enumerate ripgrep's ~150 flags;
+  any flag it didn't know made `clap` abort the whole parse, the pattern was never
+  seen, and the call fell to a lossy `clap_unparsed` fallback (≈67% of all calls).
+  The new parser reads only what the shim needs — pattern, search path, `--type`,
+  and the `-c`/`-l` output modes — and **treats every unrecognised flag as an
+  opaque, harmless token**. A future ripgrep flag can no longer derail a call.
+  The only enumeration kept is "which flags take a value" (~30 stable entries);
+  an omission is non-fatal (it can mislabel a logged pattern, never change the
+  user's actual search, which always forwards the original args verbatim).
+- Covered by unit tests (`cargo test`) for the Claude Code canonical call shape,
+  `-e`/`--regexp`, `--flag=value`, bundled short flags, `--`, and the key
+  invariant that an **unknown flag is treated as boolean, not an abort**.
+- `smart-rg --version` now reports the shim's own version (was forwarding to real
+  ripgrep because clap's `--version` returned `Err` from `try_parse_from`).
+
+### Result
+
+Verified end-to-end: previously-failing invocations (`--no-ignore --sort path
+--no-heading --color never -g '!.git' …`, `--stats --column --no-messages …`,
+`--pcre2 -e … --max-columns …`) now classify and redirect instead of being lost;
+`clap_unparsed` for new calls is **0**.
+
+## [0.3.6] - 2026-06-06
+
+### Fixed — the "fixes only last momentarily" conceptual bug
+
+The report's headline numbers were structurally pinned at zero/negative, so every
+prior fix to capture/classify/parsing was real but **invisible** — the gauge it fed
+could not move. Three root causes, diagnosed by walking the whole pipeline:
+
+- **The savings metric was unmeasurable by construction.** "Files saved" assumed
+  ast-grep reads *fewer files* than ripgrep — but both walk the same tree, so the
+  figure is always ~0. Reframed the report around what the shim actually delivers:
+  **precision** — `total_false_positives_avoided` (= `max(0, rg_results − ag_matches)`,
+  the comment/string/partial hits a naive text search surfaces that ast-grep's
+  structural match skips). Token/cost are kept as a secondary, clamped estimate.
+  No schema migration: the metric is derived from columns already stored.
+
+- **`log_comparison` was gated behind `count > 0`**, silently dropping ~83% of
+  structural redirects (24 redirects → only 4 comparison rows) from the report.
+  Every structural redirect is now recorded, including zero-match ones (a zero-match
+  ast-grep result is itself precision data).
+
+- **`estimated_cost_saved_cents` could go negative** and render as red "loss" cells.
+  Clamped at 0 both at write time and in the aggregate (so legacy negative rows
+  also render honestly).
+
+- **Version drift** — `report.html` hardcoded `v0.3.4` while the binary was `0.3.5`,
+  so a fresh build always *looked* un-deployed. The clap version attribute and the
+  report now both derive from `CARGO_PKG_VERSION` (injected via a `__SHIM_VERSION__`
+  placeholder). The report's detail table also no longer prefixes every value with a
+  literal `−`, and adds a **Noise Avoided** column.
+
+### Known follow-ups
+
+- ~~clap-derive rejects unenumerated rg flags~~ → **fixed in 0.3.7** (flag-agnostic
+  parser).
+- ~~`smart-rg --version` forwards to real ripgrep~~ → **fixed in 0.3.7**.
+- ast-grep can under-match some translated patterns (e.g. `fn main($$$)`), which
+  inflates "noise avoided"; the pattern translator deserves a separate pass. *(Still
+  open — when `--type` is absent, language inference can also pick the wrong language
+  for a mixed-extension directory.)*
+
 ## [0.3.5] - 2026-06-05
 
 ### Fixed

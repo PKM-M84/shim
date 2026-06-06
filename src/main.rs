@@ -91,158 +91,12 @@ fn ensure_home() {
 // ── CLI ──────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
-#[command(name = "smart-rg", version = "0.3.5")]
+#[command(name = "smart-rg", version = env!("CARGO_PKG_VERSION"))]
 #[command(disable_help_flag = true)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// The search pattern (regex)
-    pattern: Option<String>,
-
-    /// File or directory to search
-    #[arg(default_value = ".")]
-    path: String,
-
-    #[arg(long = "type", short = 't')]
-    file_type: Option<String>,
-
-    #[arg(short = 'l', long = "files-with-matches")]
-    files_with_matches: bool,
-
-    #[arg(short = 'n', long = "line-number")]
-    line_number: bool,
-
-    #[arg(short = 'i', long = "ignore-case")]
-    ignore_case: bool,
-
-    #[arg(short = 'B', allow_hyphen_values = true)]
-    before_context: Option<String>,
-
-    #[arg(short = 'A', allow_hyphen_values = true)]
-    after_context: Option<String>,
-
-    #[arg(short = 'C', allow_hyphen_values = true)]
-    context: Option<String>,
-
-    #[arg(long = "glob", short = 'g')]
-    glob: Option<String>,
-
-    #[arg(short = 'v', long = "invert-match")]
-    invert_match: bool,
-
-    #[arg(short = 'c', long = "count")]
-    count: bool,
-
-    #[arg(short = 'r', long = "recursive")]
-    recursive: bool,
-
-    #[arg(long = "hidden")]
-    hidden: bool,
-
-    /// Explicit pattern (same as positional PATTERN; rg's -e flag)
-    #[arg(short = 'e', long = "regexp")]
-    regexp: Option<String>,
-
-    /// Suppress filenames in output
-    #[arg(short = 'H', long = "with-filename")]
-    with_filename: bool,
-
-    #[arg(long = "no-filename")]
-    no_filename: bool,
-
-    #[arg(long = "heading")]
-    heading: bool,
-
-    #[arg(long = "no-heading")]
-    no_heading: bool,
-
-    /// Don't use ignore files (.gitignore, etc.)
-    #[arg(long = "no-ignore")]
-    no_ignore: bool,
-
-    #[arg(long = "no-ignore-dot")]
-    no_ignore_dot: bool,
-
-    #[arg(long = "no-ignore-global")]
-    no_ignore_global: bool,
-
-    #[arg(long = "no-ignore-parent")]
-    no_ignore_parent: bool,
-
-    #[arg(long = "no-ignore-vcs")]
-    no_ignore_vcs: bool,
-
-    /// Match whole words only
-    #[arg(short = 'w', long = "word-regexp")]
-    word_regexp: bool,
-
-    /// Treat pattern as literal string
-    #[arg(short = 'F', long = "fixed-strings")]
-    fixed_strings: bool,
-
-    /// Enable PCRE2 regex engine
-    #[arg(long = "pcre2")]
-    pcre2: bool,
-
-    /// Enable multiline mode
-    #[arg(short = 'U', long = "multiline")]
-    multiline: bool,
-
-    /// Follow symlinks
-    #[arg(short = 'L', long = "follow")]
-    follow: bool,
-
-    /// Print NUL byte after each filename
-    #[arg(long = "null")]
-    null: bool,
-
-    /// Strip whitespace from matches
-    #[arg(long = "trim")]
-    trim: bool,
-
-    /// Print only filenames without matches
-    #[arg(long = "files-without-match")]
-    files_without_match: bool,
-
-    /// Print only the matched part
-    #[arg(short = 'o', long = "only-matching")]
-    only_matching: bool,
-
-    /// Only search N files
-    #[arg(short = 'm', long = "max-count")]
-    max_count: Option<String>,
-
-    /// Limit directory recursion depth
-    #[arg(long = "max-depth")]
-    max_depth: Option<String>,
-
-    /// Limit file size
-    #[arg(long = "max-filesize")]
-    max_filesize: Option<String>,
-
-    /// Sort results by field
-    #[arg(long = "sort")]
-    sort: Option<String>,
-
-    /// Sort results in reverse by field
-    #[arg(long = "sortr")]
-    sortr: Option<String>,
-
-    /// When to use colors
-    #[arg(long = "color")]
-    color: Option<String>,
-
-    /// Number of threads
-    #[arg(short = 'j', long = "threads")]
-    threads: Option<String>,
-
-    /// Field separator
-    #[arg(long = "field-match-separator")]
-    field_match_separator: Option<String>,
-
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    extra: Vec<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -270,6 +124,151 @@ enum Commands {
         #[arg(long)]
         yes: bool,
     },
+}
+
+// ── Flag-agnostic rg argument extraction ─────────────────────
+//
+// We deliberately do NOT enumerate ripgrep's ~150 flags. That was an unwinnable
+// game: every release added flags Claude Code happened to use, and any one we
+// missed made clap abort the whole parse → the pattern was never seen → the call
+// fell to a lossy `clap_unparsed` fallback (≈67% of all calls). Instead we parse
+// only what the shim actually needs — pattern, search path, --type, and the two
+// output-mode booleans (-c, -l) — and treat every other token as an opaque,
+// harmless flag. The one small enumeration that remains is "which flags take a
+// VALUE" (so we don't mistake a flag's value for the pattern); it is ~30 stable
+// entries, and an omission is non-fatal (it can only mislabel the logged pattern,
+// never change the user's actual search, which always forwards the ORIGINAL args).
+#[derive(Debug, Default, PartialEq)]
+struct RgInvocation {
+    pattern: Option<String>,
+    path: String,
+    file_type: Option<String>,
+    count: bool,
+    files_with_matches: bool,
+}
+
+// Long flags that take a separate VALUE token (the `--flag value` form). The
+// `--flag=value` form is handled inline and never consumes the next token. This
+// is the ONLY flag enumeration the shim keeps — small and stable. An omission is
+// non-fatal: at worst the LOGGED pattern is slightly off; the user's search is
+// unaffected because passthrough always forwards the original args verbatim.
+const LONG_VALUE_FLAGS: &[&str] = &[
+    "--regexp", "--type", "--type-not", "--type-add", "--type-clear",
+    "--glob", "--iglob",
+    "--max-count", "--max-depth", "--maxdepth", "--max-filesize", "--max-columns",
+    "--after-context", "--before-context", "--context",
+    "--sort", "--sortr", "--color", "--colors", "--encoding", "--threads",
+    "--field-match-separator", "--field-context-separator",
+    "--context-separator", "--path-separator", "--line-separator",
+    "--ignore-file", "--file", "--replace", "--pre", "--pre-glob",
+    "--engine", "--dfa-size-limit", "--regex-size-limit", "--hostname-bin",
+];
+
+// Short flags that consume a value: -e regexp, -t type, -T type-not, -g glob,
+// -m max-count, -A/-B/-C context, -M max-columns, -j threads, -f file,
+// -r replace, -E encoding, -d max-depth.
+fn short_takes_value(c: char) -> bool {
+    matches!(c, 'e' | 't' | 'T' | 'g' | 'm' | 'A' | 'B' | 'C' | 'M' | 'j' | 'f' | 'r' | 'E' | 'd')
+}
+
+fn parse_rg_invocation(args: &[String]) -> RgInvocation {
+    let mut inv = RgInvocation { path: ".".into(), ..Default::default() };
+    let mut positionals: Vec<String> = Vec::new();
+    let mut explicit_pattern: Option<String> = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        let a = &args[i];
+
+        // Everything after `--` is positional, verbatim.
+        if a == "--" {
+            positionals.extend(args[i + 1..].iter().cloned());
+            break;
+        }
+
+        // Long flag: --name or --name=value
+        if let Some(rest) = a.strip_prefix("--") {
+            if rest.is_empty() { i += 1; continue; }
+            let (name, inline_val) = match rest.split_once('=') {
+                Some((n, v)) => (n, Some(v.to_string())),
+                None => (rest, None),
+            };
+            let full = format!("--{name}");
+            let mut value: Option<String> = inline_val;
+            if value.is_none() && LONG_VALUE_FLAGS.contains(&full.as_str()) && i + 1 < args.len() {
+                value = Some(args[i + 1].clone());
+                i += 1; // consume the value token
+            }
+            match name {
+                "regexp" | "file" => { if explicit_pattern.is_none() { explicit_pattern = value; } }
+                "type" => { if value.is_some() { inv.file_type = value; } }
+                "count" => inv.count = true,
+                "files-with-matches" => inv.files_with_matches = true,
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+
+        // Short flag(s): -x, -xyz bundle, -A3 (attached value), -e <value>.
+        // (`-` alone is ripgrep's stdin marker — falls through to positional.)
+        if a.len() >= 2 && a.starts_with('-') {
+            let chars: Vec<char> = a[1..].chars().collect();
+            let mut consumed_next = false;
+            let mut idx = 0;
+            while idx < chars.len() {
+                let c = chars[idx];
+                match c {
+                    'c' => inv.count = true,
+                    'l' => inv.files_with_matches = true,
+                    _ => {}
+                }
+                if short_takes_value(c) {
+                    // Value = remainder of this token if any, else the next token.
+                    let remainder: String = chars[idx + 1..].iter().collect();
+                    let value = if !remainder.is_empty() {
+                        remainder
+                    } else if i + 1 < args.len() {
+                        consumed_next = true;
+                        args[i + 1].clone()
+                    } else {
+                        String::new()
+                    };
+                    match c {
+                        'e' | 'f' => { if explicit_pattern.is_none() { explicit_pattern = Some(value); } }
+                        't' => inv.file_type = Some(value),
+                        _ => {}
+                    }
+                    break; // the rest of the bundle is this flag's value
+                }
+                idx += 1;
+            }
+            if consumed_next { i += 1; }
+            i += 1;
+            continue;
+        }
+
+        // Positional (pattern or path).
+        positionals.push(a.clone());
+        i += 1;
+    }
+
+    // ripgrep semantics: with -e/-f the pattern is explicit and ALL positionals
+    // are paths; otherwise the FIRST positional is the pattern and the rest are
+    // paths. The shim only searches one path (the first); passthrough forwards all.
+    let paths: &[String] = if explicit_pattern.is_some() {
+        inv.pattern = explicit_pattern;
+        &positionals
+    } else if !positionals.is_empty() {
+        inv.pattern = Some(positionals[0].clone());
+        &positionals[1..]
+    } else {
+        &[]
+    };
+    if let Some(p) = paths.first() {
+        inv.path = p.clone();
+    }
+    inv
 }
 
 // ── Main ─────────────────────────────────────────────────────
@@ -387,88 +386,37 @@ fn main() {
         return;
     }
 
+    // `smart-rg --version` reports the SHIM's version (matching Cargo.toml). Invoked
+    // as `rg`, the same flag falls through to real ripgrep so the rg contract holds.
+    let wants_version = args.iter().any(|a| a == "--version" || a == "-V")
+        || args.get(1).map(|a| a == "version").unwrap_or(false);
+    if invoked_as_smart_rg && wants_version {
+        println!("smart-rg {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     // Passthrough modes: no args, --help, -h
     if args.len() <= 1 || args.contains(&"--help".to_string()) || args.contains(&"-h".to_string()) {
         exec_real_rg(&args[1..]);
     }
 
-    let cli = match Cli::try_parse_from(args.iter()) {
-        Ok(c) => c,
-        Err(_) => {
-            // clap couldn't parse these rg flags, but we still forward to real rg.
-            // Try to extract the real search pattern so we at least log something
-            // meaningful (not glob values like "!.git" or context counts like "4").
-            // Strategy: check for -e/--regexp first, then skip known flag-value pairs
-            // and path-looking positionals, then take the first remaining non-flag arg.
-            let flags_with_values = [
-                "-e", "--regexp", "-t", "--type", "-g", "--glob",
-                "--color", "--sort", "--sortr", "-m", "--max-count",
-                "--max-depth", "--max-filesize", "-B", "--before-context",
-                "-A", "--after-context", "-C", "--context",
-                "-j", "--threads", "--field-match-separator",
-            ];
-            let mut maybe_pattern: Option<&str> = None;
-            let mut skip_next = false;
-            let mut found_regexp = false;
-            let mut i = 1usize;
-            while i < args.len() {
-                let arg = args[i].as_str();
-                if skip_next {
-                    // Check if this was after -e/--regexp — if so, it IS the pattern
-                    if found_regexp {
-                        maybe_pattern = Some(arg);
-                        break;
-                    }
-                    skip_next = false;
-                    found_regexp = false;
-                    i += 1;
-                    continue;
-                }
-                if arg == "-e" || arg == "--regexp" {
-                    skip_next = true;
-                    found_regexp = true;
-                    i += 1;
-                    continue;
-                }
-                if flags_with_values.contains(&arg) {
-                    skip_next = true;
-                    i += 1;
-                    continue;
-                }
-                if arg.starts_with('-') {
-                    i += 1;
-                    continue;
-                }
-                // Non-flag: skip if it looks like a path or count
-                if arg.starts_with('/') || arg == "." || arg == ".."
-                    || arg.parse::<u64>().is_ok()
-                    || arg.starts_with("!.")  // glob exclusion like !.git
-                {
-                    i += 1;
-                    continue;
-                }
-                maybe_pattern = Some(arg);
-                break;
-            }
-            if let Some(pat) = maybe_pattern {
-                log_event("passthrough", pat, "clap_unparsed", None, 0);
-            }
-            exec_real_rg(&args[1..]);
-        }
-    };
+    // Flag-agnostic extraction of only what the shim needs (pattern, path, type,
+    // output mode). Unrecognised flags are ignored, never a parse failure — so a
+    // new ripgrep flag can no longer knock a call onto a lossy fallback path. This
+    // replaces the clap-derive struct that had to enumerate rg's whole flag surface.
+    let inv = parse_rg_invocation(&args[1..]);
 
-    let pattern = match cli.regexp.as_ref().or(cli.pattern.as_ref()) {
+    let pattern = match inv.pattern.as_ref() {
         Some(p) => p.clone(),
-        None => {
-            exec_real_rg(&args[1..]);
-        }
+        // No search term (e.g. `--files`, `--version`, `--type-list`): forward as-is.
+        None => exec_real_rg(&args[1..]),
     };
 
-    let lang_from_type = map_lang(&cli.file_type);
+    let lang_from_type = map_lang(&inv.file_type);
     let is_structural = classify(&pattern);
 
     // If no --type flag, try to infer language from the search path's file extensions.
-    let lang = lang_from_type.or_else(|| infer_lang_from_path(&cli.path));
+    let lang = lang_from_type.or_else(|| infer_lang_from_path(&inv.path));
 
     if !is_structural || lang.is_none() {
         let reason = if !is_structural { "not_structural" } else { "no_language" };
@@ -481,7 +429,7 @@ fn main() {
 
     eprintln!("\x1b[36m🔀 smart-rg → ast-grep ({})  pattern: '{}'\x1b[0m", lang, sg_pattern);
 
-    let match_count = run_ast_grep(&sg_pattern, lang, &cli.path, &cli);
+    let match_count = run_ast_grep(&sg_pattern, lang, &inv.path, &inv);
 
     // Log the successful redirect
     log_event("structural", &sg_pattern, "redirected", Some(lang), match_count);
@@ -658,11 +606,30 @@ fn infer_lang_from_path(path: &str) -> Option<&'static str> {
         return ext_to_lang(base.extension()?.to_str()?);
     }
 
-    let mut counts: HashMap<&str, usize> = HashMap::new();
+    let mut counts: HashMap<&'static str, usize> = HashMap::new();
     // Walk up to depth 2 to keep this cheap.
     walk_for_lang(base, 0, &mut counts);
 
-    counts.into_iter().max_by_key(|(_, n)| *n).map(|(lang, _)| lang)
+    dominant_lang(&counts)
+}
+
+// Choose the dominant language from extension counts. Two rules beyond "most
+// frequent wins": (1) a real programming language always beats markup/style
+// (html/css) — a stray `report.html` next to `main.rs` must not flip a Rust dir
+// to HTML; (2) ties resolve alphabetically so the result is deterministic (a
+// HashMap's iteration order is not).
+fn dominant_lang(counts: &std::collections::HashMap<&'static str, usize>) -> Option<&'static str> {
+    const MARKUP: &[&str] = &["html", "css"];
+    // Within a group, pick the highest count; break ties by the alphabetically
+    // smaller name (then.cmp reversed) so the choice is deterministic.
+    let best = |markup_group: bool| -> Option<&'static str> {
+        counts.iter()
+            .filter(|(lang, _)| MARKUP.contains(lang) == markup_group)
+            .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
+            .map(|(lang, _)| *lang)
+    };
+    // Programming languages first; fall back to markup only if none present.
+    best(false).or_else(|| best(true))
 }
 
 fn walk_for_lang(dir: &std::path::Path, depth: u32, counts: &mut std::collections::HashMap<&'static str, usize>) {
@@ -751,11 +718,30 @@ fn classify(pattern: &str) -> bool {
 
 // ── Pattern translation ──────────────────────────────────────
 
+// A pattern like `fn main(` / `function foo(` / `func Bar(` is a FUNCTION
+// DEFINITION, not a call. Translating it to a call form (`fn main($$$)`) matches
+// NOTHING — a body-less item isn't a complete node — and adding a body
+// (`fn main($$$) { $$$ }`) misses every function that has a return type, since
+// `-> T` / `: T` sits between the `)` and the `{`. The robust, language-uniform
+// form is the bare `keyword name` signature: ast-grep matches the whole function
+// item from its prefix regardless of return type or body (verified across Rust,
+// TS, Go). The keyword must be followed by a name, so bare `func(` is a CALL to
+// something *named* `func` and stays call-form.
+fn is_fn_definition(stripped: &str) -> bool {
+    let toks: Vec<&str> = stripped.split_whitespace().collect();
+    toks.iter().enumerate().any(|(i, t)| {
+        matches!(*t, "fn" | "function" | "func") && i + 1 < toks.len()
+    })
+}
+
 fn translate_pattern(pattern: &str) -> String {
     let raw: String = pattern.chars().filter(|&c| c != '\\').collect();
     let raw = raw.trim();
 
     if let Some(stripped) = raw.strip_suffix('(') {
+        if is_fn_definition(stripped) {
+            return stripped.to_string();
+        }
         return format!("{}($$$)", stripped);
     }
 
@@ -895,7 +881,11 @@ fn log_comparison(
     // $2 per million tokens => cents = tokens * 0.0002
     let text_cost_cents = text_tokens as f64 * 0.0002;
     let ast_cost_cents = ast_tokens as f64 * 0.0002;
-    let estimated_cost_saved_cents = text_cost_cents - ast_cost_cents;
+    // Clamp at 0: the shim never "costs" money. When ast-grep finds more real
+    // matches than a literal text search (e.g. degenerate test patterns), the
+    // raw difference is negative — but a negative "saving" is meaningless and
+    // rendered the report untrustworthy (red cells). 0 is the honest floor.
+    let estimated_cost_saved_cents = (text_cost_cents - ast_cost_cents).max(0.0);
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -923,7 +913,7 @@ fn log_comparison(
 
 // ── ast-grep runner ──────────────────────────────────────────
 
-fn run_ast_grep(sg_pattern: &str, lang: &str, path: &str, cli: &Cli) -> u64 {
+fn run_ast_grep(sg_pattern: &str, lang: &str, path: &str, inv: &RgInvocation) -> u64 {
     let ag_start = std::time::Instant::now();
     let mut cmd = Command::new("ast-grep");
     cmd.arg("run")
@@ -976,9 +966,9 @@ fn run_ast_grep(sg_pattern: &str, lang: &str, path: &str, cli: &Cli) -> u64 {
     }
     let ag_file_count = ag_unique_files.len() as u64;
 
-    if cli.count {
+    if inv.count {
         println!("{}", count);
-    } else if cli.files_with_matches {
+    } else if inv.files_with_matches {
         let mut files: Vec<&str> = matches.iter()
             .filter_map(|m| m.get("file").and_then(|f| f.as_str()))
             .collect();
@@ -1001,11 +991,19 @@ fn run_ast_grep(sg_pattern: &str, lang: &str, path: &str, cli: &Cli) -> u64 {
         }
     }
 
-    // Capture comparison data (rg vs ast-grep) for ROI report. Record the RAW
+    // Capture comparison data (rg vs ast-grep) for the report. Record the RAW
     // user pattern (what rg was counted against), not the translated ast-grep
     // form, so the report's Pattern column matches the numbers beside it.
-    if count > 0 {
-        let raw_pattern = cli.pattern.as_deref().unwrap_or(sg_pattern);
+    //
+    // We log on EVERY structural redirect, including count==0. A zero-match
+    // ast-grep result is real precision data: a naive text search for the same
+    // token often still hits comments/strings/partial matches, so the
+    // false-positives-avoided figure (rg_results − ag_matches) is meaningful
+    // precisely when ast-grep found nothing. Gating on count>0 silently dropped
+    // ~83% of structural redirects from the report — the headline metric's
+    // single largest source of undercount.
+    {
+        let raw_pattern = inv.pattern.as_deref().unwrap_or(sg_pattern);
         let rg_start = Instant::now();
         let (rg_results, rg_file_count) = run_rg_count(&std::env::args().skip(1).collect::<Vec<_>>(), path);
         let rg_time_ms = rg_start.elapsed().as_millis() as u64;
@@ -1030,6 +1028,10 @@ struct StatsReport {
     errors: u64,
     redirect_rate: f64,
     total_matches_found: u64,
+    // Primary headline metric: false-positive matches a naive text search would
+    // have surfaced (comments/strings/partial hits) that ast-grep's structural
+    // match correctly skipped — summed as max(0, rg_results − ag_matches).
+    total_false_positives_avoided: u64,
     total_files_saved: u64,
     total_tokens_saved_estimate: u64,
     total_cost_saved_cents: f64,
@@ -1250,6 +1252,7 @@ fn compute_stats() -> StatsReport {
     // Comparison data (rg vs ag savings)
     let mut comparisons = Vec::new();
     let mut total_files_saved = 0u64;
+    let mut total_false_positives = 0u64;
     let mut total_tokens_saved = 0u64;
     let mut total_cost_saved = 0.0f64;
     let stmt = conn.prepare(
@@ -1269,17 +1272,23 @@ fn compute_stats() -> StatsReport {
             // so a seeded benchmark row whose estimate columns are 0 still feeds the
             // headline KPIs — otherwise the totals silently disagree with the table.
             let toks = if est_toks > 0 { est_toks } else { text_tokens.saturating_sub(ast_tokens) };
-            let cost = if est_cost != 0.0 { est_cost } else { text_cost - ast_cost };
+            // Clamp cost at 0 here too: legacy rows written before the clamp may
+            // hold a negative estimated_cost_saved_cents, and the text−ast
+            // fallback can also go negative. The headline must never show a loss.
+            let cost = if est_cost != 0.0 { est_cost.max(0.0) } else { (text_cost - ast_cost).max(0.0) };
+            let ag_matches: u64 = row.get(2)?;
+            let rg_results: u64 = row.get(5)?;
             total_files_saved += fs;
+            total_false_positives += rg_results.saturating_sub(ag_matches);
             total_tokens_saved += toks;
             total_cost_saved += cost;
             Ok(ComparisonStat {
                 pattern: row.get(0)?,
                 lang: row.get(1)?,
-                ag_matches: row.get(2)?,
+                ag_matches,
                 ag_files: row.get(3)?,
                 ag_time_ms: row.get(4)?,
-                rg_results: row.get(5)?,
+                rg_results,
                 rg_files: row.get(6)?,
                 rg_time_ms: row.get(7)?,
                 files_saved: fs,
@@ -1303,6 +1312,7 @@ fn compute_stats() -> StatsReport {
         errors,
         redirect_rate,
         total_matches_found: total_matches,
+        total_false_positives_avoided: total_false_positives,
         total_files_saved,
         total_tokens_saved_estimate: total_tokens_saved,
         total_cost_saved_cents: total_cost_saved,
@@ -1320,6 +1330,7 @@ fn empty_stats() -> StatsReport {
     StatsReport {
         total_intercepted: 0, structural: 0, passthrough: 0, errors: 0,
         redirect_rate: 0.0, total_matches_found: 0,
+        total_false_positives_avoided: 0,
         total_files_saved: 0, total_tokens_saved_estimate: 0, total_cost_saved_cents: 0.0,
         by_event: HashMap::new(), by_agent: vec![],
         by_language: HashMap::new(), by_day: vec![],
@@ -1434,7 +1445,12 @@ fn generate_report(output_path: &str, open_browser: bool) {
     let mut data_json = serde_json::to_string(&stats).unwrap_or_else(|_| "{}".into());
     // Escape </ to prevent premature script tag closure (XSS prevention)
     data_json = data_json.replace("</", r"<\/");
-    let html = REPORT_TEMPLATE.replace("__SHIM_DATA__", &data_json);
+    let html = REPORT_TEMPLATE
+        .replace("__SHIM_DATA__", &data_json)
+        // Stamp the report with the SAME version as the binary (Cargo.toml), so a
+        // fresh build can never look un-deployed because the report shows an old
+        // hardcoded version. This was a real source of "my changes didn't land".
+        .replace("__SHIM_VERSION__", env!("CARGO_PKG_VERSION"));
 
     match std::fs::write(output_path, &html) {
         Ok(_) => {
@@ -1454,5 +1470,174 @@ fn generate_report(output_path: &str, open_browser: bool) {
             eprintln!("\x1b[31mError writing report: {}\x1b[0m", e);
             std::process::exit(1);
         }
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(tokens: &[&str]) -> RgInvocation {
+        let owned: Vec<String> = tokens.iter().map(|s| s.to_string()).collect();
+        parse_rg_invocation(&owned)
+    }
+
+    #[test]
+    fn explicit_e_flag_is_the_pattern_and_positionals_are_paths() {
+        let inv = parse(&["-e", "useState(", "--type", "ts", "."]);
+        assert_eq!(inv.pattern.as_deref(), Some("useState("));
+        assert_eq!(inv.file_type.as_deref(), Some("ts"));
+        assert_eq!(inv.path, ".");
+    }
+
+    #[test]
+    fn claude_code_canonical_call_finds_pattern_past_value_flags() {
+        // The real shape that used to fall to clap_unparsed.
+        let inv = parse(&[
+            "--no-ignore", "--sort", "path", "--no-heading",
+            "--color", "never", "-g", "!.git", "useState(", "./src",
+        ]);
+        assert_eq!(inv.pattern.as_deref(), Some("useState("));
+        assert_eq!(inv.path, "./src");
+        assert_eq!(inv.file_type, None);
+    }
+
+    #[test]
+    fn first_positional_is_pattern_rest_is_path() {
+        let inv = parse(&["foo(", "./src"]);
+        assert_eq!(inv.pattern.as_deref(), Some("foo("));
+        assert_eq!(inv.path, "./src");
+    }
+
+    #[test]
+    fn short_value_and_boolean_flags() {
+        let inv = parse(&["-c", "-t", "rs", "Command::new(", "."]);
+        assert!(inv.count);
+        assert_eq!(inv.file_type.as_deref(), Some("rs"));
+        assert_eq!(inv.pattern.as_deref(), Some("Command::new("));
+        assert_eq!(inv.path, ".");
+    }
+
+    #[test]
+    fn files_with_matches_short_flag_and_default_path() {
+        let inv = parse(&["-l", "pattern"]);
+        assert!(inv.files_with_matches);
+        assert_eq!(inv.pattern.as_deref(), Some("pattern"));
+        assert_eq!(inv.path, "."); // no path positional → default
+    }
+
+    #[test]
+    fn inline_equals_value_does_not_consume_next_token() {
+        let inv = parse(&["--type=ts", "useState(", "."]);
+        assert_eq!(inv.file_type.as_deref(), Some("ts"));
+        assert_eq!(inv.pattern.as_deref(), Some("useState("));
+        assert_eq!(inv.path, ".");
+    }
+
+    #[test]
+    fn bundled_boolean_short_flags_do_not_eat_the_pattern() {
+        let inv = parse(&["-ni", "fn main("]);
+        assert!(!inv.count);
+        assert_eq!(inv.pattern.as_deref(), Some("fn main("));
+    }
+
+    #[test]
+    fn unknown_flag_is_treated_as_boolean_not_an_abort() {
+        // THE point of the rewrite: a flag we've never heard of must not swallow
+        // the pattern or derail parsing.
+        let inv = parse(&["--some-future-flag", "useState(", "."]);
+        assert_eq!(inv.pattern.as_deref(), Some("useState("));
+        assert_eq!(inv.path, ".");
+    }
+
+    #[test]
+    fn double_dash_forces_remaining_as_positionals() {
+        let inv = parse(&["-n", "--", "-weird-pattern", "src"]);
+        assert_eq!(inv.pattern.as_deref(), Some("-weird-pattern"));
+        assert_eq!(inv.path, "src");
+    }
+
+    #[test]
+    fn only_flags_no_pattern() {
+        let inv = parse(&["--version"]);
+        assert_eq!(inv.pattern, None);
+    }
+
+    // ── translate_pattern: definitions need a body in brace languages ──
+
+    // A definition translates to the bare `keyword name` signature — NOT a
+    // paren/body form. ast-grep matches the whole function item from the signature
+    // prefix regardless of return type (`-> u64`, `: number`, `error`) or body,
+    // which a `name($$$) { $$$ }` pattern does NOT (it misses every fn with a
+    // return type). Bare-name is the form that's robust without per-language churn.
+    #[test]
+    fn rust_fn_definition_becomes_bare_signature() {
+        assert_eq!(translate_pattern("fn main("), "fn main");
+    }
+
+    #[test]
+    fn ts_function_definition_becomes_bare_signature() {
+        assert_eq!(translate_pattern("function useEffect("), "function useEffect");
+    }
+
+    #[test]
+    fn go_func_definition_becomes_bare_signature() {
+        assert_eq!(translate_pattern("func Handler("), "func Handler");
+    }
+
+    #[test]
+    fn rust_fn_with_modifiers_keeps_them() {
+        assert_eq!(translate_pattern("pub async fn run("), "pub async fn run");
+    }
+
+    #[test]
+    fn call_expressions_stay_call_form() {
+        assert_eq!(translate_pattern("useState("), "useState($$$)");
+        assert_eq!(translate_pattern("Command::new("), "Command::new($$$)");
+    }
+
+    #[test]
+    fn python_def_stays_paren_only_no_braces() {
+        // Python is not a brace language; ast-grep matches `def foo($$$)` directly.
+        assert_eq!(translate_pattern("def foo("), "def foo($$$)");
+    }
+
+    #[test]
+    fn call_to_thing_named_func_is_not_a_definition() {
+        // `func(` with no name after the keyword is a CALL, not a definition.
+        assert_eq!(translate_pattern("func("), "func($$$)");
+    }
+
+    // ── dominant_lang: programming beats markup, ties deterministic ──
+
+    fn counts(pairs: &[(&'static str, usize)]) -> std::collections::HashMap<&'static str, usize> {
+        pairs.iter().cloned().collect()
+    }
+
+    #[test]
+    fn programming_language_beats_markup() {
+        assert_eq!(dominant_lang(&counts(&[("rust", 1), ("html", 1)])), Some("rust"));
+    }
+
+    #[test]
+    fn markup_used_only_when_no_programming_language_present() {
+        assert_eq!(dominant_lang(&counts(&[("html", 2), ("css", 1)])), Some("html"));
+    }
+
+    #[test]
+    fn highest_count_wins_among_programming_languages() {
+        assert_eq!(dominant_lang(&counts(&[("rust", 3), ("python", 1)])), Some("rust"));
+    }
+
+    #[test]
+    fn ties_break_alphabetically_for_determinism() {
+        assert_eq!(dominant_lang(&counts(&[("go", 2), ("rust", 2)])), Some("go"));
+    }
+
+    #[test]
+    fn empty_counts_is_none() {
+        assert_eq!(dominant_lang(&counts(&[])), None);
     }
 }
