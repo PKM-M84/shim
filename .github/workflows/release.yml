@@ -1,0 +1,54 @@
+name: release
+
+# Cuts a GitHub release whenever a version tag is pushed, so `install.sh`'s
+# `releases/latest/download/` always serves the current binary. Tagging is the
+# ONLY manual step — this removes the hand build+upload that let versions drift
+# (e.g. 0.3.5 was committed but never released).
+#
+#   git tag -a vX.Y.Z -m "..." && git push origin vX.Y.Z
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write   # needed for `gh release create`
+
+jobs:
+  release:
+    runs-on: macos-latest   # macOS runner builds both Apple targets (incl. x86_64 cross)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          cargo_ver="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          tag_ver="${GITHUB_REF_NAME#v}"
+          if [ "$cargo_ver" != "$tag_ver" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME (=$tag_ver) does not match Cargo.toml version $cargo_ver"
+            exit 1
+          fi
+          echo "version $cargo_ver matches tag $GITHUB_REF_NAME"
+
+      - name: Build both architectures
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+
+      - name: Stage release assets
+        run: |
+          mkdir -p dist
+          # Asset names MUST match what install.sh fetches from latest/download/.
+          cp target/aarch64-apple-darwin/release/smart-rg dist/smart-rg-macos-arm64
+          cp target/x86_64-apple-darwin/release/smart-rg  dist/smart-rg-macos-x86_64
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/smart-rg-macos-arm64 dist/smart-rg-macos-x86_64 \
+            --title "smart-rg $GITHUB_REF_NAME" \
+            --notes "Automated release for $GITHUB_REF_NAME. See CHANGELOG.md for details."
