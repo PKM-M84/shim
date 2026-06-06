@@ -133,7 +133,7 @@
       <h1>🪶 <span>Shim</span> Stats</h1>
     </div>
     <div class="meta">
-      <div>smart-rg v0.3.4</div>
+      <div>smart-rg v__SHIM_VERSION__</div>
       <div>Generated: <span id="genTime"></span></div>
     </div>
   </header>
@@ -176,18 +176,23 @@ function render(stats) {
   const hasComparisons = Array.isArray(stats.comparisons) && stats.comparisons.length > 0;
   const compCount = hasComparisons ? stats.comparisons.length : 0;
 
-  // === NEW SAVINGS KPIs (replacing primary operational KPIs) ===
+  // === PRECISION-FIRST KPIs ===
+  // Primary metric is "noise avoided" — false-positive matches a naive text
+  // search would surface (comments/strings/partials) that ast-grep's structural
+  // match skips. This is what the shim actually delivers; file-level "savings"
+  // are always ~0 because rg and ast-grep walk the same files. Token/cost are a
+  // secondary, clamped (never-negative) estimate derived from that precision.
   const savingsHTML = `
     <div class="kpis">
       <div class="kpi">
-        <div class="kpi-label">Total Files Saved</div>
-        <div class="kpi-value green">${(stats.total_files_saved || 0).toLocaleString()}</div>
-        <div class="kpi-sub">fewer files searched</div>
+        <div class="kpi-label">Noise Matches Avoided</div>
+        <div class="kpi-value green">${(stats.total_false_positives_avoided || 0).toLocaleString()}</div>
+        <div class="kpi-sub">false-positive hits ast-grep skipped</div>
       </div>
       <div class="kpi">
         <div class="kpi-label">Est. Tokens Saved</div>
         <div class="kpi-value accent">${(stats.total_tokens_saved_estimate || 0).toLocaleString()}</div>
-        <div class="kpi-sub">~15 tokens per match</div>
+        <div class="kpi-sub">~15 tokens / noise match</div>
       </div>
       <div class="kpi">
         <div class="kpi-label">Est. Cost Saved</div>
@@ -197,7 +202,7 @@ function render(stats) {
       <div class="kpi">
         <div class="kpi-label">Comparison Runs</div>
         <div class="kpi-value purple">${compCount}</div>
-        <div class="kpi-sub">patterns benchmarked</div>
+        <div class="kpi-sub">structural redirects measured</div>
       </div>
     </div>`;
 
@@ -228,7 +233,8 @@ function render(stats) {
       // matches×15 @ $2/M-tokens estimate when a row carries none.
       const toksR = c.text_tokens || (rgM * 15);
       const toksA = c.ast_tokens || (agM * 15);
-      const toksSaved = c.estimated_tokens_saved || (toksR - toksA);
+      const toksSaved = Math.max(0, c.estimated_tokens_saved || (toksR - toksA));
+      const noiseAvoided = Math.max(0, rgM - agM);
       const costR = c.text_cost_cents || (toksR * 0.0002);
       const costA = c.ast_cost_cents || (toksA * 0.0002);
       const netCents = c.estimated_cost_saved_cents || (costR - costA);
@@ -241,12 +247,13 @@ function render(stats) {
           <td><code class="pattern-code" style="font-size:0.68rem">${escHtml(c.pattern || '')}</code></td>
           <td class="num">${rgF.toLocaleString()}</td>
           <td class="num-accent">${agF.toLocaleString()}</td>
-          <td class="savings-cell">−${savedF} <span style="opacity:0.75;font-size:0.66rem">(${pct.toFixed(1)}%)</span></td>
+          <td class="savings-cell">${savedF} <span style="opacity:0.75;font-size:0.66rem">(${pct.toFixed(1)}%)</span></td>
           <td class="num">${rgM}</td>
           <td class="num-green">${agM}</td>
+          <td class="savings-cell">${noiseAvoided.toLocaleString()}</td>
           <td class="num">${toksR.toLocaleString()}</td>
           <td class="num-accent">${toksA.toLocaleString()}</td>
-          <td class="savings-cell">−${toksSaved.toLocaleString()}</td>
+          <td class="savings-cell">${toksSaved.toLocaleString()}</td>
           <td class="num">${costR.toFixed(2)}¢</td>
           <td class="num-green">${costA.toFixed(2)}¢</td>
           <td class="savings-cell ${netClass}">${netSign}${netDisp}¢</td>
@@ -264,6 +271,7 @@ function render(stats) {
               <th style="text-align:right">Files Saved</th>
               <th style="text-align:right">Text Matches</th>
               <th style="text-align:right">AST Matches</th>
+              <th style="text-align:right">Noise Avoided</th>
               <th style="text-align:right">Text Tokens</th>
               <th style="text-align:right">AST Tokens</th>
               <th style="text-align:right">Tokens Saved</th>

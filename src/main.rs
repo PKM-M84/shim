@@ -91,7 +91,7 @@ fn ensure_home() {
 // ── CLI ──────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
-#[command(name = "smart-rg", version = "0.3.5")]
+#[command(name = "smart-rg", version = env!("CARGO_PKG_VERSION"))]
 #[command(disable_help_flag = true)]
 struct Cli {
     #[command(subcommand)]
@@ -895,7 +895,11 @@ fn log_comparison(
     // $2 per million tokens => cents = tokens * 0.0002
     let text_cost_cents = text_tokens as f64 * 0.0002;
     let ast_cost_cents = ast_tokens as f64 * 0.0002;
-    let estimated_cost_saved_cents = text_cost_cents - ast_cost_cents;
+    // Clamp at 0: the shim never "costs" money. When ast-grep finds more real
+    // matches than a literal text search (e.g. degenerate test patterns), the
+    // raw difference is negative — but a negative "saving" is meaningless and
+    // rendered the report untrustworthy (red cells). 0 is the honest floor.
+    let estimated_cost_saved_cents = (text_cost_cents - ast_cost_cents).max(0.0);
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1001,10 +1005,18 @@ fn run_ast_grep(sg_pattern: &str, lang: &str, path: &str, cli: &Cli) -> u64 {
         }
     }
 
-    // Capture comparison data (rg vs ast-grep) for ROI report. Record the RAW
+    // Capture comparison data (rg vs ast-grep) for the report. Record the RAW
     // user pattern (what rg was counted against), not the translated ast-grep
     // form, so the report's Pattern column matches the numbers beside it.
-    if count > 0 {
+    //
+    // We log on EVERY structural redirect, including count==0. A zero-match
+    // ast-grep result is real precision data: a naive text search for the same
+    // token often still hits comments/strings/partial matches, so the
+    // false-positives-avoided figure (rg_results − ag_matches) is meaningful
+    // precisely when ast-grep found nothing. Gating on count>0 silently dropped
+    // ~83% of structural redirects from the report — the headline metric's
+    // single largest source of undercount.
+    {
         let raw_pattern = cli.pattern.as_deref().unwrap_or(sg_pattern);
         let rg_start = Instant::now();
         let (rg_results, rg_file_count) = run_rg_count(&std::env::args().skip(1).collect::<Vec<_>>(), path);
@@ -1030,6 +1042,10 @@ struct StatsReport {
     errors: u64,
     redirect_rate: f64,
     total_matches_found: u64,
+    // Primary headline metric: false-positive matches a naive text search would
+    // have surfaced (comments/strings/partial hits) that ast-grep's structural
+    // match correctly skipped — summed as max(0, rg_results − ag_matches).
+    total_false_positives_avoided: u64,
     total_files_saved: u64,
     total_tokens_saved_estimate: u64,
     total_cost_saved_cents: f64,
@@ -1250,6 +1266,7 @@ fn compute_stats() -> StatsReport {
     // Comparison data (rg vs ag savings)
     let mut comparisons = Vec::new();
     let mut total_files_saved = 0u64;
+    let mut total_false_positives = 0u64;
     let mut total_tokens_saved = 0u64;
     let mut total_cost_saved = 0.0f64;
     let stmt = conn.prepare(
@@ -1269,17 +1286,23 @@ fn compute_stats() -> StatsReport {
             // so a seeded benchmark row whose estimate columns are 0 still feeds the
             // headline KPIs — otherwise the totals silently disagree with the table.
             let toks = if est_toks > 0 { est_toks } else { text_tokens.saturating_sub(ast_tokens) };
-            let cost = if est_cost != 0.0 { est_cost } else { text_cost - ast_cost };
+            // Clamp cost at 0 here too: legacy rows written before the clamp may
+            // hold a negative estimated_cost_saved_cents, and the text−ast
+            // fallback can also go negative. The headline must never show a loss.
+            let cost = if est_cost != 0.0 { est_cost.max(0.0) } else { (text_cost - ast_cost).max(0.0) };
+            let ag_matches: u64 = row.get(2)?;
+            let rg_results: u64 = row.get(5)?;
             total_files_saved += fs;
+            total_false_positives += rg_results.saturating_sub(ag_matches);
             total_tokens_saved += toks;
             total_cost_saved += cost;
             Ok(ComparisonStat {
                 pattern: row.get(0)?,
                 lang: row.get(1)?,
-                ag_matches: row.get(2)?,
+                ag_matches,
                 ag_files: row.get(3)?,
                 ag_time_ms: row.get(4)?,
-                rg_results: row.get(5)?,
+                rg_results,
                 rg_files: row.get(6)?,
                 rg_time_ms: row.get(7)?,
                 files_saved: fs,
@@ -1303,6 +1326,7 @@ fn compute_stats() -> StatsReport {
         errors,
         redirect_rate,
         total_matches_found: total_matches,
+        total_false_positives_avoided: total_false_positives,
         total_files_saved,
         total_tokens_saved_estimate: total_tokens_saved,
         total_cost_saved_cents: total_cost_saved,
@@ -1320,6 +1344,7 @@ fn empty_stats() -> StatsReport {
     StatsReport {
         total_intercepted: 0, structural: 0, passthrough: 0, errors: 0,
         redirect_rate: 0.0, total_matches_found: 0,
+        total_false_positives_avoided: 0,
         total_files_saved: 0, total_tokens_saved_estimate: 0, total_cost_saved_cents: 0.0,
         by_event: HashMap::new(), by_agent: vec![],
         by_language: HashMap::new(), by_day: vec![],
@@ -1434,7 +1459,12 @@ fn generate_report(output_path: &str, open_browser: bool) {
     let mut data_json = serde_json::to_string(&stats).unwrap_or_else(|_| "{}".into());
     // Escape </ to prevent premature script tag closure (XSS prevention)
     data_json = data_json.replace("</", r"<\/");
-    let html = REPORT_TEMPLATE.replace("__SHIM_DATA__", &data_json);
+    let html = REPORT_TEMPLATE
+        .replace("__SHIM_DATA__", &data_json)
+        // Stamp the report with the SAME version as the binary (Cargo.toml), so a
+        // fresh build can never look un-deployed because the report shows an old
+        // hardcoded version. This was a real source of "my changes didn't land".
+        .replace("__SHIM_VERSION__", env!("CARGO_PKG_VERSION"));
 
     match std::fs::write(output_path, &html) {
         Ok(_) => {

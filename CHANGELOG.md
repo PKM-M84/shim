@@ -5,6 +5,47 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.6] - 2026-06-06
+
+### Fixed — the "fixes only last momentarily" conceptual bug
+
+The report's headline numbers were structurally pinned at zero/negative, so every
+prior fix to capture/classify/parsing was real but **invisible** — the gauge it fed
+could not move. Three root causes, diagnosed by walking the whole pipeline:
+
+- **The savings metric was unmeasurable by construction.** "Files saved" assumed
+  ast-grep reads *fewer files* than ripgrep — but both walk the same tree, so the
+  figure is always ~0. Reframed the report around what the shim actually delivers:
+  **precision** — `total_false_positives_avoided` (= `max(0, rg_results − ag_matches)`,
+  the comment/string/partial hits a naive text search surfaces that ast-grep's
+  structural match skips). Token/cost are kept as a secondary, clamped estimate.
+  No schema migration: the metric is derived from columns already stored.
+
+- **`log_comparison` was gated behind `count > 0`**, silently dropping ~83% of
+  structural redirects (24 redirects → only 4 comparison rows) from the report.
+  Every structural redirect is now recorded, including zero-match ones (a zero-match
+  ast-grep result is itself precision data).
+
+- **`estimated_cost_saved_cents` could go negative** and render as red "loss" cells.
+  Clamped at 0 both at write time and in the aggregate (so legacy negative rows
+  also render honestly).
+
+- **Version drift** — `report.html` hardcoded `v0.3.4` while the binary was `0.3.5`,
+  so a fresh build always *looked* un-deployed. The clap version attribute and the
+  report now both derive from `CARGO_PKG_VERSION` (injected via a `__SHIM_VERSION__`
+  placeholder). The report's detail table also no longer prefixes every value with a
+  literal `−`, and adds a **Noise Avoided** column.
+
+### Known follow-ups (not addressed here)
+
+- The clap-derive flag struct still rejects unenumerated ripgrep flags
+  (`clap_unparsed` ≈ 67% of calls); a flag-agnostic pattern/path extractor would end
+  the recurring "add more flags" churn.
+- `smart-rg --version` forwards to real ripgrep (clap `--version` returns `Err` from
+  `try_parse_from`, which we pass through); the shim's own version shows via `help`.
+- ast-grep can under-match some translated patterns (e.g. `fn main($$$)`), which
+  inflates "noise avoided"; the pattern translator deserves a separate pass.
+
 ## [0.3.5] - 2026-06-05
 
 ### Fixed
