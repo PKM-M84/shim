@@ -5,6 +5,33 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.7] - 2026-06-06
+
+### Changed — flag-agnostic argument parsing (ends the "add more rg flags" churn)
+
+- **Replaced the clap-derive flag struct with a purpose-built extractor**
+  (`parse_rg_invocation`). The old struct had to enumerate ripgrep's ~150 flags;
+  any flag it didn't know made `clap` abort the whole parse, the pattern was never
+  seen, and the call fell to a lossy `clap_unparsed` fallback (≈67% of all calls).
+  The new parser reads only what the shim needs — pattern, search path, `--type`,
+  and the `-c`/`-l` output modes — and **treats every unrecognised flag as an
+  opaque, harmless token**. A future ripgrep flag can no longer derail a call.
+  The only enumeration kept is "which flags take a value" (~30 stable entries);
+  an omission is non-fatal (it can mislabel a logged pattern, never change the
+  user's actual search, which always forwards the original args verbatim).
+- Covered by unit tests (`cargo test`) for the Claude Code canonical call shape,
+  `-e`/`--regexp`, `--flag=value`, bundled short flags, `--`, and the key
+  invariant that an **unknown flag is treated as boolean, not an abort**.
+- `smart-rg --version` now reports the shim's own version (was forwarding to real
+  ripgrep because clap's `--version` returned `Err` from `try_parse_from`).
+
+### Result
+
+Verified end-to-end: previously-failing invocations (`--no-ignore --sort path
+--no-heading --color never -g '!.git' …`, `--stats --column --no-messages …`,
+`--pcre2 -e … --max-columns …`) now classify and redirect instead of being lost;
+`clap_unparsed` for new calls is **0**.
+
 ## [0.3.6] - 2026-06-06
 
 ### Fixed — the "fixes only last momentarily" conceptual bug
@@ -36,15 +63,15 @@ could not move. Three root causes, diagnosed by walking the whole pipeline:
   placeholder). The report's detail table also no longer prefixes every value with a
   literal `−`, and adds a **Noise Avoided** column.
 
-### Known follow-ups (not addressed here)
+### Known follow-ups
 
-- The clap-derive flag struct still rejects unenumerated ripgrep flags
-  (`clap_unparsed` ≈ 67% of calls); a flag-agnostic pattern/path extractor would end
-  the recurring "add more flags" churn.
-- `smart-rg --version` forwards to real ripgrep (clap `--version` returns `Err` from
-  `try_parse_from`, which we pass through); the shim's own version shows via `help`.
+- ~~clap-derive rejects unenumerated rg flags~~ → **fixed in 0.3.7** (flag-agnostic
+  parser).
+- ~~`smart-rg --version` forwards to real ripgrep~~ → **fixed in 0.3.7**.
 - ast-grep can under-match some translated patterns (e.g. `fn main($$$)`), which
-  inflates "noise avoided"; the pattern translator deserves a separate pass.
+  inflates "noise avoided"; the pattern translator deserves a separate pass. *(Still
+  open — when `--type` is absent, language inference can also pick the wrong language
+  for a mixed-extension directory.)*
 
 ## [0.3.5] - 2026-06-05
 
