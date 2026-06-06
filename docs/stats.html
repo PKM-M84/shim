@@ -133,7 +133,7 @@
       <h1>🪶 <span>Shim</span> Stats</h1>
     </div>
     <div class="meta">
-      <div>smart-rg v0.3.4</div>
+      <div>smart-rg v0.3.8</div>
       <div>Generated: <span id="genTime"></span></div>
     </div>
   </header>
@@ -143,7 +143,7 @@
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
 <script>
-const DATA = {"total_intercepted":206,"structural":17,"passthrough":184,"errors":5,"redirect_rate":8.25242718446602,"total_matches_found":15,"total_files_saved":0,"total_tokens_saved_estimate":0,"total_cost_saved_cents":-0.003,"by_event":{"ast_grep_error":5,"passthrough":184,"structural":17},"by_agent":[{"agent":"unknown","total":103,"structural":12,"passthrough":86},{"agent":"claude-code","total":102,"structural":5,"passthrough":97},{"agent":"test","total":1,"structural":0,"passthrough":1}],"by_language":{"typescript":3,"html":1,"tsx":11,"rust":2},"by_day":[{"day":"2026-05-28","total":5,"structural":1},{"day":"2026-05-29","total":169,"structural":13},{"day":"2026-05-30","total":8,"structural":0},{"day":"2026-05-31","total":16,"structural":3},{"day":"2026-06-01","total":4,"structural":0},{"day":"2026-06-02","total":4,"structural":0}],"top_patterns":[{"pattern":"useState","lang":"tsx","count":8},{"pattern":"Command::new($$$)","lang":"rust","count":1},{"pattern":"fn main($$$)","lang":"rust","count":1},{"pattern":"foo($$$)","lang":"typescript","count":1},{"pattern":"kpiValue","lang":"html","count":1},{"pattern":"useCallback","lang":"tsx","count":1},{"pattern":"useEffect","lang":"tsx","count":1},{"pattern":"useMemo","lang":"tsx","count":1},{"pattern":"useState","lang":"typescript","count":1},{"pattern":"useState($$$)","lang":"typescript","count":1}],"recent_redirects":[{"pattern":"useState($$$)","lang":"typescript","matches":1,"agent":"claude-code","ts":"2026-05-31 14:01:46"},{"pattern":"foo($$$)","lang":"typescript","matches":0,"agent":"claude-code","ts":"2026-05-31 10:58:33"},{"pattern":"useState","lang":"typescript","matches":2,"agent":"claude-code","ts":"2026-05-31 10:58:33"},{"pattern":"Command::new($$$)","lang":"rust","matches":4,"agent":"claude-code","ts":"2026-05-29 21:22:16"},{"pattern":"fn main($$$)","lang":"rust","matches":0,"agent":"claude-code","ts":"2026-05-29 21:21:44"},{"pattern":"useState","lang":"tsx","matches":3,"agent":"unknown","ts":"2026-05-29 15:03:13"},{"pattern":"useState","lang":"tsx","matches":0,"agent":"unknown","ts":"2026-05-29 15:02:03"},{"pattern":"useState","lang":"tsx","matches":0,"agent":"unknown","ts":"2026-05-29 15:01:23"},{"pattern":"useState","lang":"tsx","matches":0,"agent":"unknown","ts":"2026-05-29 15:00:42"},{"pattern":"useEffect","lang":"tsx","matches":1,"agent":"unknown","ts":"2026-05-29 15:00:17"},{"pattern":"useCallback","lang":"tsx","matches":1,"agent":"unknown","ts":"2026-05-29 14:59:54"},{"pattern":"useMemo","lang":"tsx","matches":0,"agent":"unknown","ts":"2026-05-29 14:59:04"},{"pattern":"useState","lang":"tsx","matches":0,"agent":"unknown","ts":"2026-05-29 14:58:39"},{"pattern":"useState","lang":"tsx","matches":1,"agent":"unknown","ts":"2026-05-29 14:57:51"},{"pattern":"useState","lang":"tsx","matches":1,"agent":"unknown","ts":"2026-05-29 14:57:01"}],"comparisons":[{"pattern":"useState(","lang":"typescript","ag_matches":1,"ag_files":1,"ag_time_ms":23,"rg_results":0,"rg_files":0,"rg_time_ms":7,"files_saved":0,"estimated_tokens_saved":0,"estimated_cost_saved_cents":-0.003,"text_tokens":0,"ast_tokens":15,"text_cost_cents":0.0,"ast_cost_cents":0.003},{"pattern":"useState","lang":"typescript","ag_matches":2,"ag_files":1,"ag_time_ms":21,"rg_results":2,"rg_files":1,"rg_time_ms":7,"files_saved":0,"estimated_tokens_saved":0,"estimated_cost_saved_cents":0.0,"text_tokens":30,"ast_tokens":30,"text_cost_cents":0.006,"ast_cost_cents":0.006}]};
+const DATA = {"total_intercepted":6,"structural":5,"passthrough":1,"errors":0,"redirect_rate":83.33333333333334,"total_matches_found":7,"total_false_positives_avoided":3,"total_files_saved":0,"total_tokens_saved_estimate":45,"total_cost_saved_cents":0.009000000000000001,"by_event":{"structural":5,"passthrough":1},"by_agent":[{"agent":"claude-code","total":6,"structural":5,"passthrough":1}],"by_language":{"rust":2,"python":1,"tsx":2},"by_day":[{"day":"2026-06-06","total":6,"structural":5}],"top_patterns":[{"pattern":"Command::new($$$)","lang":"rust","count":1},{"pattern":"def fetch($$$)","lang":"python","count":1},{"pattern":"fn run","lang":"rust","count":1},{"pattern":"useEffect($$$)","lang":"tsx","count":1},{"pattern":"useState($$$)","lang":"tsx","count":1}],"recent_redirects":[{"pattern":"def fetch($$$)","lang":"python","matches":1,"agent":"claude-code","ts":"2026-06-06 20:56:16"},{"pattern":"fn run","lang":"rust","matches":1,"agent":"claude-code","ts":"2026-06-06 20:56:16"},{"pattern":"Command::new($$$)","lang":"rust","matches":2,"agent":"claude-code","ts":"2026-06-06 20:56:16"},{"pattern":"useEffect($$$)","lang":"tsx","matches":1,"agent":"claude-code","ts":"2026-06-06 20:56:16"},{"pattern":"useState($$$)","lang":"tsx","matches":2,"agent":"claude-code","ts":"2026-06-06 20:56:16"}],"comparisons":[{"pattern":"def fetch(","lang":"python","ag_matches":1,"ag_files":1,"ag_time_ms":6,"rg_results":1,"rg_files":1,"rg_time_ms":4,"files_saved":0,"estimated_tokens_saved":0,"estimated_cost_saved_cents":0.0,"text_tokens":15,"ast_tokens":15,"text_cost_cents":0.003,"ast_cost_cents":0.003},{"pattern":"fn run(","lang":"rust","ag_matches":1,"ag_files":1,"ag_time_ms":4,"rg_results":1,"rg_files":1,"rg_time_ms":4,"files_saved":0,"estimated_tokens_saved":0,"estimated_cost_saved_cents":0.0,"text_tokens":15,"ast_tokens":15,"text_cost_cents":0.003,"ast_cost_cents":0.003},{"pattern":"Command::new(","lang":"rust","ag_matches":2,"ag_files":1,"ag_time_ms":7,"rg_results":3,"rg_files":1,"rg_time_ms":4,"files_saved":0,"estimated_tokens_saved":15,"estimated_cost_saved_cents":0.003000000000000001,"text_tokens":45,"ast_tokens":30,"text_cost_cents":0.009000000000000001,"ast_cost_cents":0.006},{"pattern":"useEffect(","lang":"tsx","ag_matches":1,"ag_files":1,"ag_time_ms":4,"rg_results":1,"rg_files":1,"rg_time_ms":4,"files_saved":0,"estimated_tokens_saved":0,"estimated_cost_saved_cents":0.0,"text_tokens":15,"ast_tokens":15,"text_cost_cents":0.003,"ast_cost_cents":0.003},{"pattern":"useState(","lang":"tsx","ag_matches":2,"ag_files":1,"ag_time_ms":22,"rg_results":4,"rg_files":1,"rg_time_ms":5,"files_saved":0,"estimated_tokens_saved":30,"estimated_cost_saved_cents":0.006,"text_tokens":60,"ast_tokens":30,"text_cost_cents":0.012,"ast_cost_cents":0.006}]};
 const AST_COLOR = '#34d399';
 const TEXT_COLOR = '#6b7280';
 const PALETTE = ['#38bdf8','#34d399','#fbbf24','#f87171','#a78bfa','#fb923c','#2dd4bf','#f472b6'];
@@ -176,18 +176,23 @@ function render(stats) {
   const hasComparisons = Array.isArray(stats.comparisons) && stats.comparisons.length > 0;
   const compCount = hasComparisons ? stats.comparisons.length : 0;
 
-  // === NEW SAVINGS KPIs (replacing primary operational KPIs) ===
+  // === PRECISION-FIRST KPIs ===
+  // Primary metric is "noise avoided" — false-positive matches a naive text
+  // search would surface (comments/strings/partials) that ast-grep's structural
+  // match skips. This is what the shim actually delivers; file-level "savings"
+  // are always ~0 because rg and ast-grep walk the same files. Token/cost are a
+  // secondary, clamped (never-negative) estimate derived from that precision.
   const savingsHTML = `
     <div class="kpis">
       <div class="kpi">
-        <div class="kpi-label">Total Files Saved</div>
-        <div class="kpi-value green">${(stats.total_files_saved || 0).toLocaleString()}</div>
-        <div class="kpi-sub">fewer files searched</div>
+        <div class="kpi-label">Noise Matches Avoided</div>
+        <div class="kpi-value green">${(stats.total_false_positives_avoided || 0).toLocaleString()}</div>
+        <div class="kpi-sub">false-positive hits ast-grep skipped</div>
       </div>
       <div class="kpi">
         <div class="kpi-label">Est. Tokens Saved</div>
         <div class="kpi-value accent">${(stats.total_tokens_saved_estimate || 0).toLocaleString()}</div>
-        <div class="kpi-sub">~15 tokens per match</div>
+        <div class="kpi-sub">~15 tokens / noise match</div>
       </div>
       <div class="kpi">
         <div class="kpi-label">Est. Cost Saved</div>
@@ -197,7 +202,7 @@ function render(stats) {
       <div class="kpi">
         <div class="kpi-label">Comparison Runs</div>
         <div class="kpi-value purple">${compCount}</div>
-        <div class="kpi-sub">patterns benchmarked</div>
+        <div class="kpi-sub">structural redirects measured</div>
       </div>
     </div>`;
 
@@ -228,7 +233,8 @@ function render(stats) {
       // matches×15 @ $2/M-tokens estimate when a row carries none.
       const toksR = c.text_tokens || (rgM * 15);
       const toksA = c.ast_tokens || (agM * 15);
-      const toksSaved = c.estimated_tokens_saved || (toksR - toksA);
+      const toksSaved = Math.max(0, c.estimated_tokens_saved || (toksR - toksA));
+      const noiseAvoided = Math.max(0, rgM - agM);
       const costR = c.text_cost_cents || (toksR * 0.0002);
       const costA = c.ast_cost_cents || (toksA * 0.0002);
       const netCents = c.estimated_cost_saved_cents || (costR - costA);
@@ -241,12 +247,13 @@ function render(stats) {
           <td><code class="pattern-code" style="font-size:0.68rem">${escHtml(c.pattern || '')}</code></td>
           <td class="num">${rgF.toLocaleString()}</td>
           <td class="num-accent">${agF.toLocaleString()}</td>
-          <td class="savings-cell">−${savedF} <span style="opacity:0.75;font-size:0.66rem">(${pct.toFixed(1)}%)</span></td>
+          <td class="savings-cell">${savedF} <span style="opacity:0.75;font-size:0.66rem">(${pct.toFixed(1)}%)</span></td>
           <td class="num">${rgM}</td>
           <td class="num-green">${agM}</td>
+          <td class="savings-cell">${noiseAvoided.toLocaleString()}</td>
           <td class="num">${toksR.toLocaleString()}</td>
           <td class="num-accent">${toksA.toLocaleString()}</td>
-          <td class="savings-cell">−${toksSaved.toLocaleString()}</td>
+          <td class="savings-cell">${toksSaved.toLocaleString()}</td>
           <td class="num">${costR.toFixed(2)}¢</td>
           <td class="num-green">${costA.toFixed(2)}¢</td>
           <td class="savings-cell ${netClass}">${netSign}${netDisp}¢</td>
@@ -264,6 +271,7 @@ function render(stats) {
               <th style="text-align:right">Files Saved</th>
               <th style="text-align:right">Text Matches</th>
               <th style="text-align:right">AST Matches</th>
+              <th style="text-align:right">Noise Avoided</th>
               <th style="text-align:right">Text Tokens</th>
               <th style="text-align:right">AST Tokens</th>
               <th style="text-align:right">Tokens Saved</th>
