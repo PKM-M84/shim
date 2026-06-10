@@ -145,6 +145,9 @@ struct RgInvocation {
     file_type: Option<String>,
     count: bool,
     files_with_matches: bool,
+    // --files / --type-list: rg modes that take NO pattern. Positionals are all
+    // paths; pattern stays None so main forwards the call verbatim (unlogged).
+    pattern_less: bool,
 }
 
 // Long flags that take a separate VALUE token (the `--flag value` form). The
@@ -204,6 +207,7 @@ fn parse_rg_invocation(args: &[String]) -> RgInvocation {
                 "type" => { if value.is_some() { inv.file_type = value; } }
                 "count" => inv.count = true,
                 "files-with-matches" => inv.files_with_matches = true,
+                "files" | "type-list" => inv.pattern_less = true,
                 _ => {}
             }
             i += 1;
@@ -256,7 +260,11 @@ fn parse_rg_invocation(args: &[String]) -> RgInvocation {
     // ripgrep semantics: with -e/-f the pattern is explicit and ALL positionals
     // are paths; otherwise the FIRST positional is the pattern and the rest are
     // paths. The shim only searches one path (the first); passthrough forwards all.
-    let paths: &[String] = if explicit_pattern.is_some() {
+    // Pattern-less modes (--files, --type-list) have no pattern at all — every
+    // positional is a path, and pattern=None routes the call to verbatim passthrough.
+    let paths: &[String] = if inv.pattern_less {
+        &positionals
+    } else if explicit_pattern.is_some() {
         inv.pattern = explicit_pattern;
         &positionals
     } else if !positionals.is_empty() {
@@ -676,6 +684,14 @@ fn ext_to_lang(ext: &str) -> Option<&'static str> {
 fn classify(pattern: &str) -> bool {
     // Regex patterns are never structural — pass through to rg
     if pattern.contains('\\') {
+        return false;
+    }
+
+    // Path-like tokens (or regexes with slashes) are never structural. A '/'
+    // cannot appear in an identifier or call pattern in any supported language,
+    // but it does appear in every misparsed `rg --files <path>` invocation —
+    // and a dotted path (~/.claude/…) would otherwise classify as structural.
+    if pattern.contains('/') {
         return false;
     }
 
@@ -1563,6 +1579,59 @@ mod tests {
     fn only_flags_no_pattern() {
         let inv = parse(&["--version"]);
         assert_eq!(inv.pattern, None);
+    }
+
+    // ── pattern-less modes: --files / --type-list have NO pattern ──
+    //
+    // `rg --files <path>` lists files; the positional is a PATH, not a pattern.
+    // Claude Code runs this shape constantly (plugin cache scans). Taking the
+    // path as the pattern hijacked those calls into ast-grep (path classified
+    // structural via its dots), silently emptying the agent's file listings and
+    // flooding events/comparisons with junk rows that crowd real data out of
+    // the report's recent-50 KPI window.
+
+    #[test]
+    fn files_mode_positional_is_a_path_not_a_pattern() {
+        let inv = parse(&["--files", "/Users/x/.claude/plugins/cache"]);
+        assert_eq!(inv.pattern, None);
+        assert_eq!(inv.path, "/Users/x/.claude/plugins/cache");
+    }
+
+    #[test]
+    fn files_mode_with_value_flags_still_pattern_less() {
+        let inv = parse(&["--files", "-g", "*.md", "docs"]);
+        assert_eq!(inv.pattern, None);
+        assert_eq!(inv.path, "docs");
+    }
+
+    #[test]
+    fn type_list_mode_is_pattern_less() {
+        let inv = parse(&["--type-list"]);
+        assert_eq!(inv.pattern, None);
+    }
+
+    // ── classify: path-like tokens are never structural ──
+
+    #[test]
+    fn absolute_path_is_not_structural() {
+        assert!(!classify("/Users/user/.claude/plugins/cache"));
+    }
+
+    #[test]
+    fn relative_path_is_not_structural() {
+        assert!(!classify("src/main.rs"));
+    }
+
+    #[test]
+    fn regex_with_slash_alternation_is_not_structural() {
+        assert!(!classify("from.*invites/(AgentPicker|ModeSelector)"));
+    }
+
+    #[test]
+    fn real_structural_patterns_still_classify() {
+        assert!(classify("useState("));
+        assert!(classify("Command::new("));
+        assert!(classify("verify_aud"));
     }
 
     // ── translate_pattern: definitions need a body in brace languages ──
