@@ -5,6 +5,32 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.9] - 2026-06-10
+
+### Fixed — stop hijacking pattern-less rg modes (the real "stats quit again" bug)
+
+- **`rg --files <path>` is no longer treated as a search.** The flag-agnostic
+  parser took the path positional as the *pattern* (only the zero-positional
+  case was recognized as pattern-less), and `classify()` called any token
+  containing a `.` structural — so dotted paths like `~/.claude/plugins/cache`
+  were redirected to ast-grep with the **path as the search pattern**. The
+  agent's file listing silently came back empty (exit 1), and every such call
+  wrote a junk row: 124 of 206 "structural redirects" and 67% of all
+  comparison rows were phantom path-searches. `--files` / `--type-list` now
+  mark the invocation pattern-less: all positionals are paths, pattern stays
+  `None`, and the call forwards to real rg verbatim, unlogged.
+- **`classify()` rejects path-like tokens.** A `/` cannot appear in an
+  identifier or call pattern in any supported language; patterns containing
+  `/` (paths, slash-bearing regexes like `from.*invites/(A|B)`) now always
+  pass through to rg. Defense-in-depth behind the parser fix.
+- **Why stats "quit once again":** the report's headline KPIs sum the 50 most
+  recent comparison rows. Each junk row crowded a real one out of that window,
+  so every prior fix looked good for a few days and then the dashboard decayed
+  back toward zero as garbage accumulated. Fixing the garbage *source* makes
+  the window self-heal; `smart-rg prune` docs cover clearing old junk rows.
+- Covered by `cargo test`: pattern-less parsing (`--files` with paths and
+  value flags, `--type-list`) and path/regex/structural classification.
+
 ## [0.3.8] - 2026-06-06
 
 ### Fixed — pattern translation & language inference (the last two redirect gaps)
