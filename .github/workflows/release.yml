@@ -17,7 +17,7 @@ jobs:
   release:
     runs-on: macos-latest   # macOS runner builds both Apple targets (incl. x86_64 cross)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Add Rust targets
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
