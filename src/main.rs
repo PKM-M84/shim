@@ -11,6 +11,7 @@
 use clap::{Parser, Subcommand};
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -148,6 +149,10 @@ struct RgInvocation {
     // --files / --type-list: rg modes that take NO pattern. Positionals are all
     // paths; pattern stays None so main forwards the call verbatim (unlogged).
     pattern_less: bool,
+    // Whether an explicit positional PATH was given (vs the default "."). Lets
+    // main detect stream-filter calls (`cmd | rg PATTERN` with no path) that read
+    // stdin and therefore cannot be redirected to ast-grep (file-only search).
+    has_path: bool,
 }
 
 // Long flags that take a separate VALUE token (the `--flag value` form). The
@@ -275,8 +280,19 @@ fn parse_rg_invocation(args: &[String]) -> RgInvocation {
     };
     if let Some(p) = paths.first() {
         inv.path = p.clone();
+        inv.has_path = true;
     }
     inv
+}
+
+/// True when this call is FILTERING A STREAM (piped stdin) rather than searching
+/// files. ast-grep only searches file paths — it has no stdin-search mode — so
+/// `cmd | rg PATTERN` (no explicit path, stdin not a TTY) MUST go to real rg, or
+/// the piped data is silently dropped while ast-grep searches the cwd instead.
+/// An explicit path (`rg PATTERN src/`) always searches files, so it stays
+/// eligible for redirect even when the agent's stdin is not a TTY.
+fn is_stream_filter(has_path: bool, stdin_is_tty: bool) -> bool {
+    !has_path && !stdin_is_tty
 }
 
 // ── Main ─────────────────────────────────────────────────────
@@ -419,6 +435,14 @@ fn main() {
         // No search term (e.g. `--files`, `--version`, `--type-list`): forward as-is.
         None => exec_real_rg(&args[1..]),
     };
+
+    // Stream-filter guard: `cmd | rg PATTERN` reads stdin, which ast-grep cannot
+    // search. Forward verbatim so the pipe is filtered correctly instead of being
+    // silently dropped while ast-grep searches the cwd.
+    if is_stream_filter(inv.has_path, std::io::stdin().is_terminal()) {
+        log_event("passthrough", &pattern, "stream_stdin", None, 0);
+        exec_real_rg(&args[1..]);
+    }
 
     let lang_from_type = map_lang(&inv.file_type);
     let is_structural = classify(&pattern);
@@ -1525,6 +1549,24 @@ mod tests {
         let inv = parse(&["foo(", "./src"]);
         assert_eq!(inv.pattern.as_deref(), Some("foo("));
         assert_eq!(inv.path, "./src");
+    }
+
+    #[test]
+    fn has_path_set_only_when_a_positional_path_is_given() {
+        assert!(parse(&["foo(", "./src"]).has_path);
+        assert!(!parse(&["foo("]).has_path); // no path → default "." → has_path=false
+        assert!(!parse(&["-l", "pattern"]).has_path);
+    }
+
+    #[test]
+    fn stream_filter_only_for_piped_stdin_without_a_path() {
+        // `cmd | rg PATTERN` (no path, stdin not a tty) → filter the stream via real rg.
+        assert!(is_stream_filter(false, false));
+        // `rg PATTERN src/` (explicit path) → search files → eligible for redirect.
+        assert!(!is_stream_filter(true, false));
+        // `rg PATTERN` (interactive tty, no path) → rg searches cwd → redirect ok.
+        assert!(!is_stream_filter(false, true));
+        assert!(!is_stream_filter(true, true));
     }
 
     #[test]
