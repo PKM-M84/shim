@@ -1,6 +1,6 @@
 [package]
 name = "smart-rg"
-version = "0.3.10"
+version = "0.3.11"
 edition = "2021"
 description = "rg-compatible shim that redirects structural searches to ast-grep"
 

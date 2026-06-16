@@ -196,7 +196,7 @@ function render(stats) {
       </div>
       <div class="kpi">
         <div class="kpi-label">Est. Cost Saved</div>
-        <div class="kpi-value green">${(stats.total_cost_saved_cents || 0).toFixed(2)}¢</div>
+        <div class="kpi-value green">$${((stats.total_cost_saved_cents || 0) / 100).toFixed(2)}</div>
         <div class="kpi-sub">input cost avoided</div>
       </div>
       <div class="kpi">
@@ -239,7 +239,6 @@ function render(stats) {
       const costA = c.ast_cost_cents || (toksA * 0.0002);
       const netCents = c.estimated_cost_saved_cents || (costR - costA);
       const netSign = netCents >= 0 ? '+' : '−';
-      const netDisp = netCents.toFixed(2);
       const netClass = netCents >= 0 ? '' : 'red';
 
       return `
@@ -254,9 +253,9 @@ function render(stats) {
           <td class="num">${toksR.toLocaleString()}</td>
           <td class="num-accent">${toksA.toLocaleString()}</td>
           <td class="savings-cell">${toksSaved.toLocaleString()}</td>
-          <td class="num">${costR.toFixed(2)}¢</td>
-          <td class="num-green">${costA.toFixed(2)}¢</td>
-          <td class="savings-cell ${netClass}">${netSign}${netDisp}¢</td>
+          <td class="num">$${(costR / 100).toFixed(2)}</td>
+          <td class="num-green">$${(costA / 100).toFixed(2)}</td>
+          <td class="savings-cell ${netClass}">${netSign}$${Math.abs(netCents / 100).toFixed(2)}</td>
         </tr>`;
     }).join('');
 
