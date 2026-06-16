@@ -11,7 +11,7 @@ jobs:
   smoke:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: settings-merge smoke test
         run: bash tests/install_test.sh
       - name: --check / --help make no changes and exit 0
@@ -27,7 +27,7 @@ jobs:
   macos-install:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: settings-merge smoke test
         run: bash tests/install_test.sh
       - name: preview deps (no changes)
