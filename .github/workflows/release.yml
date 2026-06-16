@@ -44,11 +44,21 @@ jobs:
           cp target/aarch64-apple-darwin/release/smart-rg dist/smart-rg-macos-arm64
           cp target/x86_64-apple-darwin/release/smart-rg  dist/smart-rg-macos-x86_64
 
-      - name: Create GitHub release
+      - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+        # Idempotent: if the release was already created by hand (e.g. with
+        # curated notes), just upload the binaries to it — `gh release create`
+        # aborts on an existing tag, which once shipped a binary-less "latest"
+        # release and 404'd every install. Either path guarantees both assets.
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            dist/smart-rg-macos-arm64 dist/smart-rg-macos-x86_64 \
-            --title "smart-rg $GITHUB_REF_NAME" \
-            --notes "Automated release for $GITHUB_REF_NAME. See CHANGELOG.md for details."
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME exists — uploading binaries, keeping its notes."
+            gh release upload "$GITHUB_REF_NAME" \
+              dist/smart-rg-macos-arm64 dist/smart-rg-macos-x86_64 --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              dist/smart-rg-macos-arm64 dist/smart-rg-macos-x86_64 \
+              --title "smart-rg $GITHUB_REF_NAME" \
+              --notes "Automated release for $GITHUB_REF_NAME. See CHANGELOG.md for details."
+          fi
