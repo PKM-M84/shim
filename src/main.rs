@@ -153,6 +153,10 @@ struct RgInvocation {
     // main detect stream-filter calls (`cmd | rg PATTERN` with no path) that read
     // stdin and therefore cannot be redirected to ast-grep (file-only search).
     has_path: bool,
+    // A positional `-` (ripgrep's explicit stdin marker). ast-grep cannot read
+    // stdin, so any call that reads stdin must pass through to real rg — even
+    // when stdin is a TTY (the user asked for it explicitly).
+    reads_stdin: bool,
 }
 
 // Long flags that take a separate VALUE token (the `--flag value` form). The
@@ -278,7 +282,10 @@ fn parse_rg_invocation(args: &[String]) -> RgInvocation {
     } else {
         &[]
     };
-    if let Some(p) = paths.first() {
+    // A positional `-` is stdin, not a path. Record it so main forwards the
+    // call, and pick the first NON-dash positional as the real search path.
+    inv.reads_stdin = paths.iter().any(|p| p == "-");
+    if let Some(p) = paths.iter().find(|p| p.as_str() != "-") {
         inv.path = p.clone();
         inv.has_path = true;
     }
@@ -1556,6 +1563,30 @@ mod tests {
         assert!(parse(&["foo(", "./src"]).has_path);
         assert!(!parse(&["foo("]).has_path); // no path → default "." → has_path=false
         assert!(!parse(&["-l", "pattern"]).has_path);
+    }
+
+    #[test]
+    fn dash_positional_is_stdin_not_a_path() {
+        let inv = parse(&["PATTERN", "-"]);
+        assert_eq!(inv.pattern.as_deref(), Some("PATTERN"));
+        assert!(inv.reads_stdin, "trailing - marks explicit stdin");
+        assert!(!inv.has_path, "- is stdin, not a real path");
+    }
+
+    #[test]
+    fn dash_plus_real_path_keeps_the_real_path() {
+        let inv = parse(&["PATTERN", "-", "src/"]);
+        assert!(inv.reads_stdin, "- still marks stdin");
+        assert!(inv.has_path, "src/ is a real path");
+        assert_eq!(inv.path, "src/");
+    }
+
+    #[test]
+    fn no_dash_means_no_stdin() {
+        let inv = parse(&["foo(", "./src"]);
+        assert!(!inv.reads_stdin);
+        assert!(inv.has_path);
+        assert_eq!(inv.path, "./src");
     }
 
     #[test]
