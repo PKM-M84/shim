@@ -153,6 +153,10 @@ struct RgInvocation {
     // main detect stream-filter calls (`cmd | rg PATTERN` with no path) that read
     // stdin and therefore cannot be redirected to ast-grep (file-only search).
     has_path: bool,
+    // A positional `-` (ripgrep's explicit stdin marker). ast-grep cannot read
+    // stdin, so any call that reads stdin must pass through to real rg — even
+    // when stdin is a TTY (the user asked for it explicitly).
+    reads_stdin: bool,
 }
 
 // Long flags that take a separate VALUE token (the `--flag value` form). The
@@ -278,7 +282,10 @@ fn parse_rg_invocation(args: &[String]) -> RgInvocation {
     } else {
         &[]
     };
-    if let Some(p) = paths.first() {
+    // A positional `-` is stdin, not a path. Record it so main forwards the
+    // call, and pick the first NON-dash positional as the real search path.
+    inv.reads_stdin = paths.iter().any(|p| p == "-");
+    if let Some(p) = paths.iter().find(|p| p.as_str() != "-") {
         inv.path = p.clone();
         inv.has_path = true;
     }
@@ -439,8 +446,11 @@ fn main() {
     // Stream-filter guard: `cmd | rg PATTERN` reads stdin, which ast-grep cannot
     // search. Forward verbatim so the pipe is filtered correctly instead of being
     // silently dropped while ast-grep searches the cwd.
-    if is_stream_filter(inv.has_path, std::io::stdin().is_terminal()) {
-        log_event("passthrough", &pattern, "stream_stdin", None, 0);
+    // Explicit `-` stdin OR an implicit pipe (no path + non-TTY stdin): ast-grep
+    // has no stdin-search mode, so forward verbatim or the stream is dropped.
+    if inv.reads_stdin || is_stream_filter(inv.has_path, std::io::stdin().is_terminal()) {
+        let reason = if inv.reads_stdin { "stdin_dash" } else { "stream_stdin" };
+        log_event("passthrough", &pattern, reason, None, 0);
         exec_real_rg(&args[1..]);
     }
 
@@ -463,13 +473,17 @@ fn main() {
 
     let match_count = run_ast_grep(&sg_pattern, lang, &inv.path, &inv);
 
-    // Log the successful redirect
-    log_event("structural", &sg_pattern, "redirected", Some(lang), match_count);
-
+    // run_ast_grep already handled genuine errors (non-empty stderr -> exec real
+    // rg before returning), so here a clean run with 0 matches means ast-grep
+    // found nothing — commonly a wrong-language guess over a polyglot tree. Fall
+    // back to real rg so the user gets real hits instead of a silent empty.
+    // Logged as `fallback`, never a structural win, so the noise-avoided metric
+    // stays honest.
     if match_count == 0 {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        std::process::exit(1);
+        log_event("fallback", &pattern, "ast_grep_empty", Some(lang), 0);
+        exec_real_rg(&args[1..]);
     }
+    log_event("structural", &sg_pattern, "redirected", Some(lang), match_count);
 }
 
 // ── Real rg executor ─────────────────────────────────────────
@@ -1035,14 +1049,11 @@ fn run_ast_grep(sg_pattern: &str, lang: &str, path: &str, inv: &RgInvocation) ->
     // user pattern (what rg was counted against), not the translated ast-grep
     // form, so the report's Pattern column matches the numbers beside it.
     //
-    // We log on EVERY structural redirect, including count==0. A zero-match
-    // ast-grep result is real precision data: a naive text search for the same
-    // token often still hits comments/strings/partial matches, so the
-    // false-positives-avoided figure (rg_results − ag_matches) is meaningful
-    // precisely when ast-grep found nothing. Gating on count>0 silently dropped
-    // ~83% of structural redirects from the report — the headline metric's
-    // single largest source of undercount.
-    {
+    // Only credit savings when ast-grep actually won (count > 0). On a 0-match
+    // redirect main now falls back to real rg and SHOWS those results, so
+    // crediting "noise avoided" for them would be false. (Supersedes the earlier
+    // v0.3.6 "log every redirect incl. count==0" choice — see issue #12.)
+    if count > 0 {
         let raw_pattern = inv.pattern.as_deref().unwrap_or(sg_pattern);
         let rg_start = Instant::now();
         let (rg_results, rg_file_count) = run_rg_count(&std::env::args().skip(1).collect::<Vec<_>>(), path);
@@ -1165,7 +1176,7 @@ fn compute_stats() -> StatsReport {
     ).unwrap_or(0);
 
     let errors: u64 = conn.query_row(
-        "SELECT COUNT(*) FROM events WHERE event LIKE '%error%' OR event='untranslatable'",
+        "SELECT COUNT(*) FROM events WHERE event LIKE '%error%' OR event='untranslatable' OR event='fallback'",
         [], |r| r.get(0)
     ).unwrap_or(0);
 
@@ -1556,6 +1567,30 @@ mod tests {
         assert!(parse(&["foo(", "./src"]).has_path);
         assert!(!parse(&["foo("]).has_path); // no path → default "." → has_path=false
         assert!(!parse(&["-l", "pattern"]).has_path);
+    }
+
+    #[test]
+    fn dash_positional_is_stdin_not_a_path() {
+        let inv = parse(&["PATTERN", "-"]);
+        assert_eq!(inv.pattern.as_deref(), Some("PATTERN"));
+        assert!(inv.reads_stdin, "trailing - marks explicit stdin");
+        assert!(!inv.has_path, "- is stdin, not a real path");
+    }
+
+    #[test]
+    fn dash_plus_real_path_keeps_the_real_path() {
+        let inv = parse(&["PATTERN", "-", "src/"]);
+        assert!(inv.reads_stdin, "- still marks stdin");
+        assert!(inv.has_path, "src/ is a real path");
+        assert_eq!(inv.path, "src/");
+    }
+
+    #[test]
+    fn no_dash_means_no_stdin() {
+        let inv = parse(&["foo(", "./src"]);
+        assert!(!inv.reads_stdin);
+        assert!(inv.has_path);
+        assert_eq!(inv.path, "./src");
     }
 
     #[test]
