@@ -77,6 +77,15 @@ the right language) will now also be logged `fallback` rather than
 `structural`+0. That is acceptable and arguably more accurate — a 0-match
 redirect was never a real noise-avoided win.
 
+**Comparison-row gating (required for honesty).** The report's savings figures
+(`files_saved`, `estimated_tokens_saved`, `estimated_cost_saved_cents`) come
+from the `comparisons` table, which `run_ast_grep` currently writes on **every**
+redirect including `count==0` (the v0.3.6 "0-match is precision data" choice,
+main.rs:1038-1051). With the fallback, a 0-match redirect now shows the user the
+rg results, so crediting noise-avoided for it would be false. Therefore the
+`log_comparison` call must be **gated on `count > 0`** — a fallback writes no
+savings row. This supersedes the v0.3.6 count==0 logging comment.
+
 ### C. `rg PATTERN -` stdin fix
 
 In `parse_rg_invocation`, a positional equal to `-` is recognised as stdin: it
