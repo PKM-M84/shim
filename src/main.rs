@@ -302,6 +302,31 @@ fn is_stream_filter(has_path: bool, stdin_is_tty: bool) -> bool {
     !has_path && !stdin_is_tty
 }
 
+/// What to do after attempting an ast-grep redirect.
+#[derive(Debug, PartialEq, Eq)]
+enum RedirectOutcome {
+    /// ast-grep found matches and printed them — count it as a real win.
+    Win,
+    /// ast-grep ran cleanly but found nothing. Fall back to real rg so a
+    /// wrong-language guess (or any blind spot) can't return a silent empty.
+    FallbackEmpty,
+    /// ast-grep wrote to stderr — a genuine error. Fall back to real rg.
+    FallbackError,
+}
+
+/// Decide the outcome from ast-grep's match count and whether stderr was empty.
+/// A non-empty stderr is a real error and always falls back; otherwise zero
+/// matches falls back and any matches is a win.
+fn redirect_outcome(match_count: u64, stderr_empty: bool) -> RedirectOutcome {
+    if !stderr_empty {
+        RedirectOutcome::FallbackError
+    } else if match_count == 0 {
+        RedirectOutcome::FallbackEmpty
+    } else {
+        RedirectOutcome::Win
+    }
+}
+
 // ── Main ─────────────────────────────────────────────────────
 
 // Human-facing help for the `smart-rg` management command. (Invoked as `rg`,
@@ -1590,6 +1615,23 @@ mod tests {
         assert!(!inv.reads_stdin);
         assert!(inv.has_path);
         assert_eq!(inv.path, "./src");
+    }
+
+    #[test]
+    fn redirect_outcome_win_when_matches_and_no_stderr() {
+        assert_eq!(redirect_outcome(3, true), RedirectOutcome::Win);
+    }
+
+    #[test]
+    fn redirect_outcome_fallback_empty_when_zero_and_no_stderr() {
+        assert_eq!(redirect_outcome(0, true), RedirectOutcome::FallbackEmpty);
+    }
+
+    #[test]
+    fn redirect_outcome_fallback_error_when_stderr_present() {
+        // A genuine ast-grep error falls back regardless of count.
+        assert_eq!(redirect_outcome(0, false), RedirectOutcome::FallbackError);
+        assert_eq!(redirect_outcome(5, false), RedirectOutcome::FallbackError);
     }
 
     #[test]
