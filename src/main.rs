@@ -1176,7 +1176,7 @@ fn compute_stats() -> StatsReport {
     ).unwrap_or(0);
 
     let errors: u64 = conn.query_row(
-        "SELECT COUNT(*) FROM events WHERE event LIKE '%error%' OR event='untranslatable'",
+        "SELECT COUNT(*) FROM events WHERE event LIKE '%error%' OR event='untranslatable' OR event='fallback'",
         [], |r| r.get(0)
     ).unwrap_or(0);
 
