@@ -498,12 +498,20 @@ fn main() {
 
     let match_count = run_ast_grep(&sg_pattern, lang, &inv.path, &inv);
 
-    // Log the successful redirect
-    log_event("structural", &sg_pattern, "redirected", Some(lang), match_count);
-
-    if match_count == 0 {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        std::process::exit(1);
+    // run_ast_grep already handled the FallbackError case (non-empty stderr ->
+    // exec real rg). Here we only see clean runs, so empty stderr is implied.
+    match redirect_outcome(match_count, true) {
+        RedirectOutcome::Win => {
+            log_event("structural", &sg_pattern, "redirected", Some(lang), match_count);
+        }
+        RedirectOutcome::FallbackEmpty | RedirectOutcome::FallbackError => {
+            // ast-grep found nothing (often a wrong-language guess over a
+            // polyglot tree). Fall back to real rg so the user gets real hits
+            // instead of a silent empty. Logged as `fallback`, never a
+            // structural win, so the report's noise-avoided metric stays honest.
+            log_event("fallback", &pattern, "ast_grep_empty", Some(lang), 0);
+            exec_real_rg(&args[1..]);
+        }
     }
 }
 
