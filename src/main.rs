@@ -1077,7 +1077,11 @@ fn run_ast_grep(sg_pattern: &str, lang: &str, path: &str, inv: &RgInvocation) ->
     // precisely when ast-grep found nothing. Gating on count>0 silently dropped
     // ~83% of structural redirects from the report — the headline metric's
     // single largest source of undercount.
-    {
+    // Only credit savings when ast-grep actually won (count > 0). On a 0-match
+    // redirect main now falls back to real rg and SHOWS those results, so
+    // crediting "noise avoided" for them would be false. (Supersedes the earlier
+    // v0.3.6 "log every redirect incl. count==0" choice — see issue #12.)
+    if count > 0 {
         let raw_pattern = inv.pattern.as_deref().unwrap_or(sg_pattern);
         let rg_start = Instant::now();
         let (rg_results, rg_file_count) = run_rg_count(&std::env::args().skip(1).collect::<Vec<_>>(), path);
