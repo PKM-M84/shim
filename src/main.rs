@@ -302,31 +302,6 @@ fn is_stream_filter(has_path: bool, stdin_is_tty: bool) -> bool {
     !has_path && !stdin_is_tty
 }
 
-/// What to do after attempting an ast-grep redirect.
-#[derive(Debug, PartialEq, Eq)]
-enum RedirectOutcome {
-    /// ast-grep found matches and printed them — count it as a real win.
-    Win,
-    /// ast-grep ran cleanly but found nothing. Fall back to real rg so a
-    /// wrong-language guess (or any blind spot) can't return a silent empty.
-    FallbackEmpty,
-    /// ast-grep wrote to stderr — a genuine error. Fall back to real rg.
-    FallbackError,
-}
-
-/// Decide the outcome from ast-grep's match count and whether stderr was empty.
-/// A non-empty stderr is a real error and always falls back; otherwise zero
-/// matches falls back and any matches is a win.
-fn redirect_outcome(match_count: u64, stderr_empty: bool) -> RedirectOutcome {
-    if !stderr_empty {
-        RedirectOutcome::FallbackError
-    } else if match_count == 0 {
-        RedirectOutcome::FallbackEmpty
-    } else {
-        RedirectOutcome::Win
-    }
-}
-
 // ── Main ─────────────────────────────────────────────────────
 
 // Human-facing help for the `smart-rg` management command. (Invoked as `rg`,
@@ -498,21 +473,17 @@ fn main() {
 
     let match_count = run_ast_grep(&sg_pattern, lang, &inv.path, &inv);
 
-    // run_ast_grep already handled the FallbackError case (non-empty stderr ->
-    // exec real rg). Here we only see clean runs, so empty stderr is implied.
-    match redirect_outcome(match_count, true) {
-        RedirectOutcome::Win => {
-            log_event("structural", &sg_pattern, "redirected", Some(lang), match_count);
-        }
-        RedirectOutcome::FallbackEmpty | RedirectOutcome::FallbackError => {
-            // ast-grep found nothing (often a wrong-language guess over a
-            // polyglot tree). Fall back to real rg so the user gets real hits
-            // instead of a silent empty. Logged as `fallback`, never a
-            // structural win, so the report's noise-avoided metric stays honest.
-            log_event("fallback", &pattern, "ast_grep_empty", Some(lang), 0);
-            exec_real_rg(&args[1..]);
-        }
+    // run_ast_grep already handled genuine errors (non-empty stderr -> exec real
+    // rg before returning), so here a clean run with 0 matches means ast-grep
+    // found nothing — commonly a wrong-language guess over a polyglot tree. Fall
+    // back to real rg so the user gets real hits instead of a silent empty.
+    // Logged as `fallback`, never a structural win, so the noise-avoided metric
+    // stays honest.
+    if match_count == 0 {
+        log_event("fallback", &pattern, "ast_grep_empty", Some(lang), 0);
+        exec_real_rg(&args[1..]);
     }
+    log_event("structural", &sg_pattern, "redirected", Some(lang), match_count);
 }
 
 // ── Real rg executor ─────────────────────────────────────────
@@ -1078,13 +1049,6 @@ fn run_ast_grep(sg_pattern: &str, lang: &str, path: &str, inv: &RgInvocation) ->
     // user pattern (what rg was counted against), not the translated ast-grep
     // form, so the report's Pattern column matches the numbers beside it.
     //
-    // We log on EVERY structural redirect, including count==0. A zero-match
-    // ast-grep result is real precision data: a naive text search for the same
-    // token often still hits comments/strings/partial matches, so the
-    // false-positives-avoided figure (rg_results − ag_matches) is meaningful
-    // precisely when ast-grep found nothing. Gating on count>0 silently dropped
-    // ~83% of structural redirects from the report — the headline metric's
-    // single largest source of undercount.
     // Only credit savings when ast-grep actually won (count > 0). On a 0-match
     // redirect main now falls back to real rg and SHOWS those results, so
     // crediting "noise avoided" for them would be false. (Supersedes the earlier
@@ -1627,23 +1591,6 @@ mod tests {
         assert!(!inv.reads_stdin);
         assert!(inv.has_path);
         assert_eq!(inv.path, "./src");
-    }
-
-    #[test]
-    fn redirect_outcome_win_when_matches_and_no_stderr() {
-        assert_eq!(redirect_outcome(3, true), RedirectOutcome::Win);
-    }
-
-    #[test]
-    fn redirect_outcome_fallback_empty_when_zero_and_no_stderr() {
-        assert_eq!(redirect_outcome(0, true), RedirectOutcome::FallbackEmpty);
-    }
-
-    #[test]
-    fn redirect_outcome_fallback_error_when_stderr_present() {
-        // A genuine ast-grep error falls back regardless of count.
-        assert_eq!(redirect_outcome(0, false), RedirectOutcome::FallbackError);
-        assert_eq!(redirect_outcome(5, false), RedirectOutcome::FallbackError);
     }
 
     #[test]
