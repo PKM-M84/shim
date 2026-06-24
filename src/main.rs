@@ -446,8 +446,11 @@ fn main() {
     // Stream-filter guard: `cmd | rg PATTERN` reads stdin, which ast-grep cannot
     // search. Forward verbatim so the pipe is filtered correctly instead of being
     // silently dropped while ast-grep searches the cwd.
-    if is_stream_filter(inv.has_path, std::io::stdin().is_terminal()) {
-        log_event("passthrough", &pattern, "stream_stdin", None, 0);
+    // Explicit `-` stdin OR an implicit pipe (no path + non-TTY stdin): ast-grep
+    // has no stdin-search mode, so forward verbatim or the stream is dropped.
+    if inv.reads_stdin || is_stream_filter(inv.has_path, std::io::stdin().is_terminal()) {
+        let reason = if inv.reads_stdin { "stdin_dash" } else { "stream_stdin" };
+        log_event("passthrough", &pattern, reason, None, 0);
         exec_real_rg(&args[1..]);
     }
 
