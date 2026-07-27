@@ -30,8 +30,8 @@ Measured over 1,379 events (30 days, live `agent=claude-code` traffic): only
   text search.
 
 The pipeline itself is now: parse → passthrough checks (stdin, pattern-less,
-unsupported flags, `--no-smart`) unchanged → `classify` says text, forward
-verbatim, unchanged → `classify` says structural:
+unsupported flags) behave as before, plus the new `--no-smart` → `classify`
+says text, forward verbatim, unchanged → `classify` says structural:
 
 1. Run real ripgrep **captured** with `--json`, the user's filter flags kept,
    output-mode flags stripped.
@@ -52,6 +52,11 @@ verbatim, unchanged → `classify` says structural:
    stderr notice (`N matches not confirmed as structural by ast-grep — rerun
    with --no-smart`) instead of silently deleting them.
 
+- **New: `--no-smart`.** Forces plain ripgrep with no structural filtering,
+  for when you want every text match back. It is the remedy the suppression
+  notice points at, and it is stripped before forwarding so ripgrep never
+  sees a flag it does not recognise.
+
 Every successful redirect previously cost two spawns anyway (ast-grep, then a
 second rg run — `run_rg_count` — just for the comparison baseline); this
 inversion doesn't add a spawn on the win path and removes one on every
@@ -60,10 +65,12 @@ both deleted; `run_ast_grep_on_files` (explicit file list, not a directory
 walk, so ripgrep and ast-grep can no longer disagree about ignore rules)
 replaces them.
 
-Covered by `cargo test` (110 tests) and end-to-end against the release
-binary: polyglot symbols found in every language they appear in, a
-continuation-line hit surviving containment, unsearched-file-type hits kept
-in full, comment/string hits suppressed with the stderr notice, `--no-smart`
+Covered by `cargo test` (110 tests) — including containment against a
+synthetic multi-line node span, the one case a realistic fixture cannot
+produce, since ripgrep matches the very text that seeds the ast-grep node —
+and end-to-end against the release binary: polyglot symbols found in every
+language they appear in, unsearched-file-type hits kept in full,
+comment/string hits suppressed with the stderr notice, `--no-smart`
 restoring ripgrep's raw output, and a true no-match exiting 1 and logging
 `no_match/rg_empty`. The v0.3.13 nine-flag passthrough matrix (`-v`,
 `--invert-match`, `-A2`, `-C 1`, `-i`, `-m1`, `-o`, `-F`,
