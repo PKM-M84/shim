@@ -423,9 +423,43 @@ echo "✓ Binary: $BIN"
 migrate_old_shim
 
 mkdir -p "$SRG_BIN"
-cp "$BIN" "$SRG_BIN/rg"
-chmod +x "$SRG_BIN/rg"
-echo "✓ Installed shim → $SRG_BIN/rg"
+
+# Stage, verify, then atomically swap into place.
+#
+# $SRG_BIN/rg sits FIRST on PATH, so a half-written or non-functional binary
+# there breaks every `rg` invocation on the machine — including Claude Code's
+# Grep tool. Copying straight onto it opens a window for exactly that: an
+# interrupted copy, a full disk, or a release archive built for another arch.
+#
+# Instead: copy into a staging dir *inside* $SRG_BIN (same filesystem, so the
+# rename below is atomic), prove the binary runs, and only then move it over.
+# Any failure leaves the previous install in place and still working.
+#
+# The staged file is named `smart-rg` deliberately — the shim routes on argv[0]
+# and only self-reports under that name. Under any other name it forwards to
+# real ripgrep via rg2, which need not exist yet on a first install.
+STAGE="$(mktemp -d "$SRG_BIN/.stage.XXXXXX")"
+trap 'rm -rf "$STAGE"' EXIT
+cp "$BIN" "$STAGE/smart-rg"
+chmod +x "$STAGE/smart-rg"
+
+staged_version="$("$STAGE/smart-rg" --version 2>&1 || true)"
+case "$staged_version" in
+    "smart-rg "*) ;;   # ran and identified itself — safe to install
+    *)
+        echo "✗ The built binary does not run on this machine. Install aborted."
+        echo "   \`smart-rg --version\` reported: ${staged_version:-<no output>}"
+        if [ -x "$SRG_BIN/rg" ]; then
+            echo "   Your existing install is untouched and still on PATH."
+        fi
+        exit 1
+        ;;
+esac
+
+mv "$STAGE/smart-rg" "$SRG_BIN/rg"
+rmdir "$STAGE" 2>/dev/null || true
+trap - EXIT
+echo "✓ Installed shim → $SRG_BIN/rg  ($staged_version)"
 
 # Also expose a `smart-rg` command (relative symlink to the same binary, which
 # routes subcommands by argv) so the documented `smart-rg stats` / `report` work
