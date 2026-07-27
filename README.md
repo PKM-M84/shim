@@ -238,7 +238,9 @@ smart-rg prune [--days 30]             # delete logged events older than N days
 smart-rg reset --yes                   # wipe ALL stats — events + comparisons (clean slate)
 ```
 
-The HTML report shows the **rg vs ast-grep comparison** per pattern — files matched, estimated tokens, and cost saved — the same shape as the benchmark table above. Comparison rows can carry **real** token/cost figures; live captures fall back to a `matches × 15 tokens @ $2/M` estimate.
+The HTML report shows the **rg vs ast-grep comparison** per pattern — files matched, estimated tokens, and cost saved — the same shape as the benchmark table above. Comparison rows can carry **real** token/cost figures; live captures fall back to a `matches × 15 tokens` estimate priced at **$5.00 per million input tokens** (Claude Opus 5's input rate — search results are tokens the model *reads*).
+>
+> Cost is derived at render time from the token counts, never summed from per-row figures written at an older rate, so changing the rate reprices the whole history rather than blending two prices in one number. The rate lives in one place: `INPUT_COST_PER_MTOK_USD` in `src/main.rs`.
 
 Two optional env vars:
 

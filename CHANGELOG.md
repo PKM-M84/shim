@@ -5,6 +5,29 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.17] - 2026-07-27
+
+### Changed
+- Cost estimates now use **Claude Opus 5's real input rate of $5.00/MTok**, replacing an
+  undocumented hardcoded $2.00/MTok. Reported savings rise ~2.5x; nothing about the
+  measurement changed, only the price the tokens are valued at.
+- The rate and the tokens-per-match assumption are named constants
+  (`INPUT_COST_PER_MTOK_USD`, `TOKENS_PER_MATCH`) exported into the report JSON. The HTML
+  no longer carries its own copy of the rate, so the page cannot quote a price the data
+  wasn't valued at.
+- **Cost is derived from token counts at render time** instead of summed from the cents
+  stored on each row. Stored cents are frozen at whatever rate was compiled in the day the
+  row was written, so summing them would have made the headline KPI a silent blend of old
+  and new prices. Deriving reprices all history at once. The stored columns remain for
+  anyone reading the DB directly.
+- The report labels its own assumptions: "input cost avoided @ $5.00/M".
+
+### Notes
+- Input pricing is the correct side: search results are tokens the model reads, never
+  writes. Opus 5's $25.00/MTok output rate does not apply.
+- `TOKENS_PER_MATCH` (15) is still an unvalidated estimate. It scales both sides of every
+  comparison equally, so it cancels out of the ratio and only sets absolute scale.
+
 ## [0.3.16] - 2026-07-27
 
 ### Fixed — C++ searches were getting no structural filtering at all
