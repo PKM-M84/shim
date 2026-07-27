@@ -177,6 +177,12 @@ struct RgInvocation {
     // -n/--line-number → Some(true), -N/--no-line-number → Some(false), unset →
     // None, meaning rg's own default (on for a TTY, off when piped).
     line_numbers: Option<bool>,
+    // The argv for the internal `rg --json` capture run: the caller's tokens with
+    // output-mode flags removed (or rewritten, for bundles that also carry a
+    // filter) and shim-owned flags removed. Built during the SAME walk that
+    // parses everything else, so it cannot disagree with that parse about the
+    // `--` boundary or about which tokens are flag VALUES.
+    capture_argv: Vec<String>,
 }
 
 // Flags that change WHICH lines match, or the shape of the output, in a way
@@ -251,6 +257,21 @@ fn strip_shim_flags(args: &[String], shim_indices: &[usize]) -> Vec<String> {
         .collect()
 }
 
+// Long flags that select an OUTPUT MODE — the long-form counterpart of
+// `is_output_mode_short` below. These must never reach the internal `--json`
+// capture run: ripgrep's mode precedence lets them beat `--json` regardless of
+// position, so the capture would come back as plain text, fail to parse, and
+// look exactly like a genuine no-match.
+fn is_output_mode_long(name: &str) -> bool {
+    matches!(
+        name,
+        "count" | "count-matches" | "files-with-matches"
+            | "line-number" | "no-line-number"
+            | "heading" | "no-heading"
+            | "json"
+    )
+}
+
 fn parse_rg_invocation(args: &[String]) -> RgInvocation {
     let mut inv = RgInvocation { path: ".".into(), ..Default::default() };
     let mut positionals: Vec<String> = Vec::new();
@@ -264,6 +285,8 @@ fn parse_rg_invocation(args: &[String]) -> RgInvocation {
         // Everything after `--` is positional, verbatim.
         if a == "--" {
             positionals.extend(args[i + 1..].iter().cloned());
+            inv.capture_argv.push("--".to_string());
+            inv.capture_argv.extend(args[i + 1..].iter().cloned());
             break;
         }
 
@@ -276,17 +299,19 @@ fn parse_rg_invocation(args: &[String]) -> RgInvocation {
             };
             let full = format!("--{name}");
             let mut value: Option<String> = inline_val;
+            let mut consumed_next = false;
             if value.is_none() && LONG_VALUE_FLAGS.contains(&full.as_str()) && i + 1 < args.len() {
                 value = Some(args[i + 1].clone());
+                consumed_next = true;
                 i += 1; // consume the value token
             }
             if UNSUPPORTED_LONG.contains(&name) && inv.unsupported.is_none() {
                 inv.unsupported = Some(full.clone());
             }
             match name {
-                "regexp" | "file" => { if explicit_pattern.is_none() { explicit_pattern = value; } }
-                "type" => { if value.is_some() { inv.file_type = value; } }
-                "glob" => { if let Some(v) = value { inv.globs.push(v); } }
+                "regexp" | "file" => { if explicit_pattern.is_none() { explicit_pattern = value.clone(); } }
+                "type" => { if value.is_some() { inv.file_type = value.clone(); } }
+                "glob" => { if let Some(v) = &value { inv.globs.push(v.clone()); } }
                 "count" => inv.count = true,
                 "files-with-matches" => inv.files_with_matches = true,
                 "files" | "type-list" => inv.pattern_less = true,
@@ -297,6 +322,15 @@ fn parse_rg_invocation(args: &[String]) -> RgInvocation {
                     inv.shim_flag_indices.push(token_start);
                 }
                 _ => {}
+            }
+            // Capture argv: keep the token unless it's an output-mode flag (it
+            // would beat --json in ripgrep's own mode precedence) or the shim's
+            // own flag (ripgrep has never heard of it).
+            if !is_output_mode_long(name) && name != "no-smart" {
+                inv.capture_argv.push(a.clone());
+                if consumed_next {
+                    inv.capture_argv.push(value.clone().unwrap());
+                }
             }
             i += 1;
             continue;
@@ -341,6 +375,15 @@ fn parse_rg_invocation(args: &[String]) -> RgInvocation {
                 }
                 idx += 1;
             }
+            // Capture argv: rewrite drops only output-mode chars, never a
+            // value-taking char, so whenever a value was consumed the flag
+            // itself survives the rewrite — push the value verbatim, unexamined.
+            if let Some(rewritten) = rewrite_short_token(a) {
+                inv.capture_argv.push(rewritten);
+                if consumed_next {
+                    inv.capture_argv.push(args[i + 1].clone());
+                }
+            }
             if consumed_next { i += 1; }
             i += 1;
             continue;
@@ -348,6 +391,7 @@ fn parse_rg_invocation(args: &[String]) -> RgInvocation {
 
         // Positional (pattern or path).
         positionals.push(a.clone());
+        inv.capture_argv.push(a.clone());
         i += 1;
     }
 
@@ -1230,49 +1274,28 @@ fn rewrite_short_token(token: &str) -> Option<String> {
     }
 }
 
-/// Build the argv for the internal ripgrep run: the caller's FILTER flags are
-/// kept (`-g`, `--type`, `-w`, the pattern, the paths) and OUTPUT-MODE flags are
-/// dropped, because we render the shape ourselves from the filtered set.
+/// Prepend `--json` to the capture argv the parser produced.
 ///
-/// Dropping `-n`/`-N` loses nothing: the caller's preference is already recorded
-/// on `RgInvocation.line_numbers` and rendering reads it from there.
-fn rg_capture_args(original: &[String]) -> Vec<String> {
+/// The argv itself is built by `parse_rg_invocation` during its own walk, so it
+/// agrees with that parse about the `--` boundary and about which tokens are
+/// flag VALUES. Re-deriving those roles from string shape here produced four
+/// separate silent-wrong-search bugs before this was moved.
+fn capture_command_args(capture_argv: &[String]) -> Vec<String> {
     let mut out = vec!["--json".to_string()];
-    for arg in original {
-        // Long-form output-mode flags: exact token match.
-        if matches!(
-            arg.as_str(),
-            "--count" | "--count-matches" | "--files-with-matches"
-                | "--line-number" | "--no-line-number"
-                | "--heading" | "--no-heading"
-                | "--json"
-        ) {
-            continue;
-        }
-        // Short-flag tokens may bundle modes with filters (`-cg`, `-ntrust`).
-        // Rewrite rather than drop: a bare `-` is ripgrep's stdin marker, not a
-        // flag, so require len >= 2.
-        if arg.len() >= 2 && arg.starts_with('-') && !arg.starts_with("--") {
-            if let Some(rewritten) = rewrite_short_token(arg) {
-                out.push(rewritten);
-            }
-            continue;
-        }
-        out.push(arg.clone());
-    }
+    out.extend(capture_argv.iter().cloned());
     out
 }
 
 /// Run the real ripgrep and capture its matches. ripgrep exits 1 on "no
 /// matches", which is a normal empty result, not a failure — only a spawn
 /// failure or an exit code above 1 is treated as `Failed`.
-fn run_rg_capture(original: &[String]) -> RgCapture {
+fn run_rg_capture(capture_argv: &[String]) -> RgCapture {
     let rg = match real_rg_path() {
         Some(p) => p,
         None => return RgCapture::Failed,
     };
     let output = match Command::new(&rg)
-        .args(rg_capture_args(original))
+        .args(capture_command_args(capture_argv))
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
@@ -2817,50 +2840,47 @@ mod tests {
         assert_eq!(langs, vec!["python", "typescript"], "BTreeMap orders by language");
     }
 
-    // ── capturing rg: strip output-mode flags, keep filters ──
+    // ── capturing rg: capture_argv is a byproduct of the parser's own walk ──
 
     #[test]
-    fn rg_capture_args_strip_output_modes_and_add_json() {
-        let args = strs(&["-c", "-n", "--heading", "-g", "*.ts", "deviceId", "src"]);
-        let out = rg_capture_args(&args);
-        assert!(out.contains(&"--json".to_string()));
+    fn capture_argv_strips_output_modes_and_keeps_filters() {
+        let inv = parse(&["-c", "-n", "--heading", "-g", "*.ts", "deviceId", "src"]);
         for stripped in ["-c", "-n", "--heading"] {
-            assert!(!out.contains(&stripped.to_string()), "{stripped} must be stripped");
+            assert!(!inv.capture_argv.contains(&stripped.to_string()), "{stripped} must be stripped");
         }
         // Filters and positionals survive, in order.
-        assert!(out.windows(2).any(|w| w == ["-g".to_string(), "*.ts".to_string()]));
-        assert!(out.contains(&"deviceId".to_string()));
-        assert!(out.contains(&"src".to_string()));
+        assert!(inv.capture_argv.windows(2).any(|w| w == ["-g".to_string(), "*.ts".to_string()]));
+        assert!(inv.capture_argv.contains(&"deviceId".to_string()));
+        assert!(inv.capture_argv.contains(&"src".to_string()));
     }
 
     #[test]
-    fn rg_capture_args_keep_the_type_filter() {
-        let out = rg_capture_args(&strs(&["--type", "ts", "deviceId", "src"]));
-        assert!(out.windows(2).any(|w| w == ["--type".to_string(), "ts".to_string()]));
+    fn capture_argv_keeps_the_type_filter_adjacent_to_its_value() {
+        let inv = parse(&["--type", "ts", "deviceId", "src"]);
+        assert!(inv.capture_argv.windows(2).any(|w| w == ["--type".to_string(), "ts".to_string()]));
     }
 
     #[test]
-    fn rg_capture_args_strip_bundled_short_output_flags() {
+    fn capture_argv_strips_bundled_short_output_flags() {
         // `-nc` is ordinary ripgrep usage. Exact-token matching missed it, and
         // rg's mode precedence let -c beat --json, so the capture came back as
         // plain text and parsed to a silent false-empty.
-        let out = rg_capture_args(&strs(&["-nc", "deviceId", "src"]));
-        assert!(!out.iter().any(|a| a == "-nc"), "bundled -nc must be stripped");
-        assert!(out.contains(&"--json".to_string()));
-        assert!(out.contains(&"deviceId".to_string()));
-        assert!(out.contains(&"src".to_string()));
+        let inv = parse(&["-nc", "deviceId", "src"]);
+        assert!(!inv.capture_argv.iter().any(|a| a == "-nc"), "bundled -nc must be stripped");
+        assert!(inv.capture_argv.contains(&"deviceId".to_string()));
+        assert!(inv.capture_argv.contains(&"src".to_string()));
     }
 
     #[test]
-    fn rg_capture_args_strip_bundled_cl() {
-        let out = rg_capture_args(&strs(&["-cl", "deviceId", "src"]));
-        assert!(!out.iter().any(|a| a == "-cl"), "bundled -cl must be stripped");
+    fn capture_argv_strips_bundled_cl() {
+        let inv = parse(&["-cl", "deviceId", "src"]);
+        assert!(!inv.capture_argv.iter().any(|a| a == "-cl"), "bundled -cl must be stripped");
     }
 
     #[test]
-    fn rg_capture_args_keep_a_bare_dash_stdin_marker() {
-        let out = rg_capture_args(&strs(&["deviceId", "-"]));
-        assert!(out.contains(&"-".to_string()), "a bare - is stdin, not a flag");
+    fn capture_argv_keeps_a_bare_dash_stdin_marker() {
+        let inv = parse(&["deviceId", "-"]);
+        assert!(inv.capture_argv.contains(&"-".to_string()), "a bare - is stdin, not a flag");
     }
 
     #[test]
@@ -2873,74 +2893,113 @@ mod tests {
     }
 
     #[test]
-    fn rg_capture_args_keep_a_bundled_type_value() {
+    fn capture_argv_keeps_a_bundled_type_value() {
         // `-tcpp` is `--type cpp`. Scanning every character saw the 'c' in the
         // VALUE and dropped the caller's type filter entirely.
-        let out = rg_capture_args(&strs(&["-tcpp", "deviceId", "src"]));
-        assert!(out.contains(&"-tcpp".to_string()), "-t's bundled value must survive");
+        let inv = parse(&["-tcpp", "deviceId", "src"]);
+        assert!(inv.capture_argv.contains(&"-tcpp".to_string()), "-t's bundled value must survive");
     }
 
     #[test]
-    fn rg_capture_args_keep_a_bundled_glob_value() {
-        let out = rg_capture_args(&strs(&["-g*.c", "deviceId", "src"]));
-        assert!(out.contains(&"-g*.c".to_string()), "-g's bundled value must survive");
+    fn capture_argv_keeps_a_bundled_glob_value() {
+        let inv = parse(&["-g*.c", "deviceId", "src"]);
+        assert!(inv.capture_argv.contains(&"-g*.c".to_string()), "-g's bundled value must survive");
     }
 
     #[test]
-    fn rg_capture_args_keep_a_bundled_pattern_value() {
+    fn capture_argv_keeps_a_bundled_pattern_value() {
         // `-eDeviceId` carries the SEARCH TERM. Dropping it made ripgrep treat
         // the path as the pattern — a silent wrong answer.
-        let out = rg_capture_args(&strs(&["-eDeviceId", "src"]));
-        assert!(out.contains(&"-eDeviceId".to_string()), "-e's bundled pattern must survive");
+        let inv = parse(&["-eDeviceId", "src"]);
+        assert!(inv.capture_argv.contains(&"-eDeviceId".to_string()), "-e's bundled pattern must survive");
     }
 
     #[test]
-    fn rg_capture_args_still_strip_output_mode_before_a_value_flag() {
+    fn capture_argv_still_strips_output_mode_before_a_value_flag() {
         // `-cg` is count bundled ahead of a glob: the 'c' comes first, so the
         // token is rewritten to just `-g` (output mode dropped, filter kept).
-        let out = rg_capture_args(&strs(&["-cg", "*.ts", "deviceId", "src"]));
-        assert!(!out.iter().any(|a| a == "-cg"), "bundled -cg token must be rewritten");
-        assert!(out.contains(&"-g".to_string()), "-g must survive so *.ts stays its value");
-        assert!(out.contains(&"*.ts".to_string()));
+        let inv = parse(&["-cg", "*.ts", "deviceId", "src"]);
+        assert!(!inv.capture_argv.iter().any(|a| a == "-cg"), "bundled -cg token must be rewritten");
+        assert!(inv.capture_argv.contains(&"-g".to_string()), "-g must survive so *.ts stays its value");
+        assert!(inv.capture_argv.contains(&"*.ts".to_string()));
     }
 
     #[test]
-    fn rg_capture_args_keep_the_glob_flag_from_a_mixed_bundle() {
+    fn capture_argv_keeps_the_glob_flag_from_a_mixed_bundle() {
         // `-cg *.ts` is count + glob whose value is the NEXT token. Dropping the
         // whole token orphaned "*.ts" as a bare positional, shifting ripgrep's
         // pattern/path split and silently changing what is searched.
-        let out = rg_capture_args(&strs(&["-cg", "*.ts", "deviceId", "src"]));
-        assert!(out.contains(&"-g".to_string()), "-g must survive so *.ts stays its value");
-        assert!(!out.iter().any(|a| a == "-cg"));
-        assert!(out.contains(&"*.ts".to_string()));
+        let inv = parse(&["-cg", "*.ts", "deviceId", "src"]);
+        assert!(inv.capture_argv.contains(&"-g".to_string()), "-g must survive so *.ts stays its value");
+        assert!(!inv.capture_argv.iter().any(|a| a == "-cg"));
+        assert!(inv.capture_argv.contains(&"*.ts".to_string()));
     }
 
     #[test]
-    fn rg_capture_args_keep_an_inline_value_from_a_mixed_bundle() {
+    fn capture_argv_keeps_an_inline_value_from_a_mixed_bundle() {
         // `-ntrust` is -n bundled with `--type rust`. Rewriting keeps `-trust` so
         // the type filter is preserved.
-        let out = rg_capture_args(&strs(&["-ntrust", "deviceId", "src"]));
-        assert!(out.contains(&"-trust".to_string()), "the type filter must survive");
+        let inv = parse(&["-ntrust", "deviceId", "src"]);
+        assert!(inv.capture_argv.contains(&"-trust".to_string()), "the type filter must survive");
     }
 
     #[test]
-    fn rg_capture_args_keep_the_pattern_flag_from_a_mixed_bundle() {
+    fn capture_argv_keeps_the_pattern_flag_from_a_mixed_bundle() {
         // `src -ce DeviceId`: -e carries the PATTERN. Rewriting to `-e` preserves it.
-        let out = rg_capture_args(&strs(&["src", "-ce", "DeviceId"]));
-        assert_eq!(out, strs(&["--json", "src", "-e", "DeviceId"]));
+        let inv = parse(&["src", "-ce", "DeviceId"]);
+        assert_eq!(inv.capture_argv, strs(&["src", "-e", "DeviceId"]));
     }
 
     #[test]
-    fn rg_capture_args_keep_a_non_output_filter_from_a_bundle() {
+    fn capture_argv_keeps_a_non_output_filter_from_a_bundle() {
         // -w is a word-boundary FILTER; only the -n may be removed.
-        let out = rg_capture_args(&strs(&["-nw", "deviceId", "src"]));
-        assert!(out.contains(&"-w".to_string()), "-w must survive");
+        let inv = parse(&["-nw", "deviceId", "src"]);
+        assert!(inv.capture_argv.contains(&"-w".to_string()), "-w must survive");
     }
 
     #[test]
-    fn rg_capture_args_drop_a_token_that_is_only_output_modes() {
-        let out = rg_capture_args(&strs(&["-nc", "deviceId", "src"]));
-        assert!(!out.iter().any(|a| a.starts_with('-') && a != "--json"),
+    fn capture_argv_drops_a_token_that_is_only_output_modes() {
+        let inv = parse(&["-nc", "deviceId", "src"]);
+        assert!(!inv.capture_argv.iter().any(|a| a.starts_with('-')),
             "-nc is purely output modes and must vanish entirely");
+    }
+
+    // ── round 4: capture_argv is a byproduct of the parser's own walk ──
+
+    #[test]
+    fn capture_argv_treats_everything_after_double_dash_as_positional() {
+        // `rg pattern -- -c` searches for `pattern` in a FILE named `-c`.
+        let inv = parse(&["pattern", "--", "-c"]);
+        assert_eq!(inv.capture_argv, strs(&["pattern", "--", "-c"]));
+    }
+
+    #[test]
+    fn capture_argv_never_mangles_a_post_double_dash_filename() {
+        // `-count.log` had its 'c' and 'n' stripped out of it.
+        let inv = parse(&["pattern", "--", "-count.log"]);
+        assert_eq!(inv.capture_argv, strs(&["pattern", "--", "-count.log"]));
+    }
+
+    #[test]
+    fn capture_argv_does_not_reinterpret_a_dash_prefixed_flag_value() {
+        // `rg -e -c src` searches for the literal text `-c` inside src/.
+        // Re-running "-c" through flag classification dropped it, so rg took
+        // "src" as the pattern and searched the cwd instead.
+        let inv = parse(&["-e", "-c", "src"]);
+        assert_eq!(inv.capture_argv, strs(&["-e", "-c", "src"]));
+    }
+
+    #[test]
+    fn capture_argv_omits_the_shim_own_flag() {
+        let inv = parse(&["--no-smart", "deviceId", "src"]);
+        assert_eq!(inv.capture_argv, strs(&["deviceId", "src"]));
+    }
+
+    #[test]
+    fn capture_command_args_prepends_json() {
+        assert_eq!(
+            capture_command_args(&strs(&["deviceId", "src"])),
+            strs(&["--json", "deviceId", "src"])
+        );
     }
 }
