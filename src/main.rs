@@ -1084,6 +1084,43 @@ fn log_comparison(
 
 // ── ast-grep result parsing & ripgrep-shaped output ──────────
 
+/// One matching line as ripgrep reported it. Distinct from `AgMatch`: this is a
+/// LINE ripgrep hit, whereas an `AgMatch` is a syntax NODE ast-grep confirmed.
+#[derive(Debug, PartialEq, Clone)]
+struct RgMatch {
+    file: String,
+    line: u64,
+    text: String,
+}
+
+/// Parse ripgrep's `--json` event stream (one JSON object per line), keeping
+/// only `match` records.
+///
+/// `--json` is used rather than `path:line:text` because a path may itself
+/// contain a colon. Paths that are not valid UTF-8 arrive as a `bytes` field
+/// instead of `text` and are skipped — they cannot be handed to ast-grep anyway.
+fn parse_rg_json(stdout: &str) -> Vec<RgMatch> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+            if v.get("type")?.as_str()? != "match" {
+                return None;
+            }
+            let d = v.get("data")?;
+            Some(RgMatch {
+                file: d.get("path")?.get("text")?.as_str()?.to_string(),
+                line: d.get("line_number")?.as_u64()?,
+                // ripgrep includes the trailing newline; strip it so rendering
+                // controls line breaks.
+                text: d.get("lines")?.get("text")?.as_str()?
+                    .trim_end_matches('\n')
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug, PartialEq)]
 struct AgMatch {
     file: String,
@@ -2361,5 +2398,40 @@ mod tests {
         );
         let m = parse_ag_matches(&stdout);
         assert_eq!(render_output(&m, OutputMode::FilesWithMatches), "src/a.ts\nsrc/b.ts\n");
+    }
+
+    // ── ripgrep --json parsing ──
+
+    fn rg_json_match(file: &str, line: u64, text: &str) -> String {
+        format!(
+            r#"{{"type":"match","data":{{"path":{{"text":"{file}"}},"lines":{{"text":"{text}\n"}},"line_number":{line},"absolute_offset":0,"submatches":[]}}}}"#
+        )
+    }
+
+    #[test]
+    fn parses_a_match_record_with_one_based_line() {
+        let m = parse_rg_json(&rg_json_match("src/a.ts", 1, "const deviceId = 1;"));
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].file, "src/a.ts");
+        assert_eq!(m[0].line, 1, "ripgrep line_number is already 1-based");
+        assert_eq!(m[0].text, "const deviceId = 1;", "trailing newline stripped");
+    }
+
+    #[test]
+    fn ignores_non_match_records() {
+        let stream = format!(
+            "{}\n{}\n{}",
+            r#"{"type":"begin","data":{"path":{"text":"src/a.ts"}}}"#,
+            rg_json_match("src/a.ts", 3, "hit"),
+            r#"{"type":"end","data":{"path":{"text":"src/a.ts"}}}"#
+        );
+        let m = parse_rg_json(&stream);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].line, 3);
+    }
+
+    #[test]
+    fn empty_stream_yields_no_matches() {
+        assert!(parse_rg_json("").is_empty());
     }
 }
