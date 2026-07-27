@@ -668,23 +668,17 @@ fn main() {
     let sg_pattern = translate_pattern(&pattern);
 
     let ag_start = Instant::now();
-    let mut ag: Vec<AgMatch> = Vec::new();
-    let mut searched: HashSet<String> = HashSet::new();
-    for (lang, lang_files) in &by_lang {
-        let found = run_ast_grep_on_files(&sg_pattern, lang, lang_files);
-        if found.is_empty() {
-            // This language confirmed NOTHING. Either ast-grep failed, or the
-            // grammar was wrong for these files — and those are indistinguishable,
-            // because a wrong-grammar run exits 1 with no output and NO stderr.
-            // Treat the whole language as NOT SEARCHED so its hits are kept.
-            // Errs toward showing a comment, never toward dropping a real call.
-            continue;
-        }
-        searched.extend(lang_files.iter().map(|f| norm_path(f.as_str()).to_string()));
-        ag.extend(found);
-    }
+    // LANGUAGE granularity: this catches a whole language confirming nothing
+    // (wrong grammar / spawn failure — indistinguishable, see
+    // confirm_by_language). A file ast-grep silently skips WITHIN an otherwise
+    // confirming language is not caught here and stays suppressed.
+    let (ag, searched, confirming_langs) =
+        confirm_by_language(&by_lang, |lang, files| run_ast_grep_on_files(&sg_pattern, lang, files));
     let ag_time_ms = ag_start.elapsed().as_millis() as u64;
-    let lang_label = by_lang.keys().copied().collect::<Vec<&str>>().join(",");
+    // Only languages that actually confirmed something are credited. Labelling
+    // a run "css,html,python" for a single Python confirmation would corrupt
+    // the Top-languages KPI, which groups on this string verbatim.
+    let lang_label = confirming_langs.join(",");
 
     let out = filter_matches(&hits, &ag, &searched);
 
@@ -695,11 +689,14 @@ fn main() {
         print!("{}", render_output(&hits, output_mode(&inv)));
         std::process::exit(0);
     }
+    // lang_label is non-empty from here on: out.confirmed_hits > 0 requires at
+    // least one language in confirming_langs, since that is the only way
+    // filter_matches counts a confirmation.
 
     if out.suppressed > 0 {
         eprintln!(
-            "\x1b[36msmart-rg: {} text-only match{} suppressed \
-             (comments/strings/SQL) — rerun with --no-smart\x1b[0m",
+            "\x1b[36msmart-rg: {} match{} not confirmed as structural by ast-grep \
+             — rerun with --no-smart\x1b[0m",
             out.suppressed,
             if out.suppressed == 1 { "" } else { "es" }
         );
@@ -711,12 +708,23 @@ fn main() {
         .map(|h| norm_path(h.file.as_str()))
         .filter(|f| searched.contains(*f))
         .collect();
+    // Files ast-grep CONFIRMED at least one hit in. Must be a subset of the
+    // searched files, or the report claims ast-grep searched more files than
+    // ripgrep did — the inverse of this tool's premise. Deriving it from
+    // `searched` also revives `files_saved`, which was pinned at 0 while both
+    // counts measured the same set.
+    let confirmed_files: HashSet<&str> = out
+        .kept
+        .iter()
+        .map(|h| norm_path(h.file.as_str()))
+        .filter(|f| searched.contains(*f))
+        .collect();
     log_event("structural", &sg_pattern, "filtered", Some(&lang_label), out.confirmed_hits as u64);
     // Comparison covers SEARCHED files only: counting hits ast-grep never saw
     // would manufacture fake "noise avoided".
     log_comparison(
         &pattern, &lang_label,
-        out.confirmed_hits as u64, by_lang.values().flatten().count() as u64, ag_time_ms,
+        out.confirmed_hits as u64, confirmed_files.len() as u64, ag_time_ms,
         out.searched_hits as u64, searched_files.len() as u64, rg_time_ms,
     );
 }
@@ -1094,7 +1102,8 @@ struct RgMatch {
 }
 
 /// Parse ripgrep's `--json` event stream, returning the matches and a count of
-/// `match` records that could NOT be parsed.
+/// lines that could NOT be parsed: either not valid JSON at all, or a `match`
+/// record whose fields could not be extracted.
 ///
 /// `--json` is used rather than `path:line:text` because a path may itself
 /// contain a colon. ripgrep emits `lines.bytes` (base64) instead of
@@ -1109,7 +1118,14 @@ fn parse_rg_json(stdout: &str) -> (Vec<RgMatch>, usize) {
     for line in stdout.lines() {
         let v: serde_json::Value = match serde_json::from_str(line.trim()) {
             Ok(v) => v,
-            Err(_) => continue,
+            // A line ripgrep emitted that we cannot even parse as JSON is
+            // exactly the case this return value exists to catch: it may hold
+            // a real match we cannot represent, so it must be counted, not
+            // silently skipped.
+            Err(_) => {
+                unparseable += 1;
+                continue;
+            }
         };
         if v.get("type").and_then(|t| t.as_str()) != Some("match") {
             continue;
@@ -1403,6 +1419,36 @@ fn run_ast_grep_on_files(sg_pattern: &str, lang: &str, files: &[String]) -> Vec<
         Ok(o) => parse_ag_matches(&String::from_utf8_lossy(&o.stdout)),
         Err(_) => Vec::new(),
     }
+}
+
+/// Run ast-grep once per language and report which files were genuinely
+/// searched, i.e. belong to a language that confirmed at least one match.
+///
+/// A language that confirms nothing is treated as NOT SEARCHED, because a
+/// wrong-grammar run exits 1 with no output and NO stderr — indistinguishable
+/// from a genuine empty. Its files' hits are then kept rather than suppressed.
+/// The runner is injected so this decision is testable without spawning
+/// ast-grep; `main()` passes `run_ast_grep_on_files`.
+fn confirm_by_language<F>(
+    by_lang: &BTreeMap<&'static str, Vec<String>>,
+    mut run: F,
+) -> (Vec<AgMatch>, HashSet<String>, Vec<&'static str>)
+where
+    F: FnMut(&str, &[String]) -> Vec<AgMatch>,
+{
+    let mut ag = Vec::new();
+    let mut searched = HashSet::new();
+    let mut confirming = Vec::new();
+    for (lang, files) in by_lang {
+        let found = run(lang, files);
+        if found.is_empty() {
+            continue;
+        }
+        searched.extend(files.iter().map(|f| norm_path(f.as_str()).to_string()));
+        confirming.push(*lang);
+        ag.extend(found);
+    }
+    (ag, searched, confirming)
 }
 
 /// The output shape the caller asked for.
@@ -2525,6 +2571,30 @@ mod tests {
         let out = filter_matches(&hits, &ag, &searched_set(&["app.py"]));
         assert_eq!(out.kept.len(), 2, "the .html hit must survive: html confirmed nothing");
         assert_eq!(out.suppressed, 0);
+    }
+
+    #[test]
+    fn a_language_that_confirms_nothing_is_excluded_from_searched() {
+        // The root-cause test for C1: a real JS call inside a .html file was
+        // suppressed because ast-grep parsed it as HTML and confirmed nothing —
+        // and a wrong-grammar run is indistinguishable from a genuine empty.
+        let mut by_lang: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+        by_lang.insert("python", strs(&["app.py"]));
+        by_lang.insert("html", strs(&["page.html"]));
+
+        // python confirms; html returns nothing, as a wrong-grammar run does.
+        let (ag, searched, confirming) = confirm_by_language(&by_lang, |lang, _files| {
+            if lang == "python" {
+                parse_ag_matches(&ag_json("app.py", 1, "    render_chart(d)"))
+            } else {
+                Vec::new()
+            }
+        });
+
+        assert_eq!(ag.len(), 1);
+        assert!(searched.contains("app.py"));
+        assert!(!searched.contains("page.html"), "html confirmed nothing => not searched");
+        assert_eq!(confirming, vec!["python"], "only confirming languages are credited");
     }
 
     // ── the comparison metric covers SEARCHED files only ──
