@@ -5,6 +5,70 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.15] - 2026-07-27
+
+### Changed — invert the pipeline: ripgrep runs first, ast-grep filters its hits
+
+Measured over 1,379 events (30 days, live `agent=claude-code` traffic): only
+10.7% of intercepted searches actually redirected, and failed redirects
+(18.1%, ast-grep came back empty) outnumbered wins. Two real defects, not one:
+
+- **Language was guessed from the filesystem, not from the data.**
+  `infer_lang_from_path` picked one dominant language for the whole search
+  path, so on a polyglot repo the symbol usually lived in a language that
+  wasn't chosen — `arming_snapshot` alone was attempted as python (5×),
+  javascript (4×) and typescript (2×) before ever finding its actual `.ts`
+  file. `group_files_by_lang` now derives language from the extensions of the
+  files ripgrep **actually hit**, so every language present in the results
+  gets its own ast-grep pass, run once each rather than guessed once.
+- **`classify()` rejected the canonical way an agent writes a call search.**
+  An escaped literal like `store_mls_message\(` was 29 of 900 "not
+  structural" passthroughs — a real false negative, not a deliberate
+  rejection. `literal_form` now reduces an escaped pattern to its literal text
+  before classifying it, so `\(`, `\)`, and `\.` read as the structural
+  signals they are, while `\.env` (a leading/trailing dot) still reads as a
+  text search.
+
+The pipeline itself is now: parse → passthrough checks (stdin, pattern-less,
+unsupported flags, `--no-smart`) unchanged → `classify` says text, forward
+verbatim, unchanged → `classify` says structural:
+
+1. Run real ripgrep **captured** with `--json`, the user's filter flags kept,
+   output-mode flags stripped.
+2. Zero hits → print nothing, exit 1, log `no_match/rg_empty` — ast-grep is
+   never spawned for a search that was always going to be empty.
+3. Hits found → run ast-grep once per language against just the files that
+   matched, confirm each ripgrep hit by **containment**: does its line fall
+   anywhere inside a confirmed node's `[start, end]` span, not only at the
+   node's start line (a multi-line call's continuation-line arguments used to
+   be silently dropped by start-line equality). A file `group_files_by_lang`
+   can't map — `.sql`, `.md`, unmapped extensions — is never handed to
+   ast-grep, so it has no standing to suppress those hits; they're kept in
+   full. A language that confirms nothing is treated as unsearched for the
+   same reason, rather than as a wrong-grammar wipeout.
+4. All of a language's hits confirmed-empty → print every ripgrep hit for
+   those files and log `fallback`, honestly, instead of returning nothing.
+5. Otherwise → print the confirmed hits, and for the rest print a single
+   stderr notice (`N matches not confirmed as structural by ast-grep — rerun
+   with --no-smart`) instead of silently deleting them.
+
+Every successful redirect previously cost two spawns anyway (ast-grep, then a
+second rg run — `run_rg_count` — just for the comparison baseline); this
+inversion doesn't add a spawn on the win path and removes one on every
+zero-hit search. `run_rg_count` and the old flag-limited `run_ast_grep` are
+both deleted; `run_ast_grep_on_files` (explicit file list, not a directory
+walk, so ripgrep and ast-grep can no longer disagree about ignore rules)
+replaces them.
+
+Covered by `cargo test` (110 tests) and end-to-end against the release
+binary: polyglot symbols found in every language they appear in, a
+continuation-line hit surviving containment, unsearched-file-type hits kept
+in full, comment/string hits suppressed with the stderr notice, `--no-smart`
+restoring ripgrep's raw output, and a true no-match exiting 1 and logging
+`no_match/rg_empty`. The v0.3.13 nine-flag passthrough matrix (`-v`,
+`--invert-match`, `-A2`, `-C 1`, `-i`, `-m1`, `-o`, `-F`,
+`--files-without-match`) remains byte-identical to real ripgrep.
+
 ## [0.3.14] - 2026-07-26
 
 ### Fixed — the report's headline numbers describe the whole dataset
