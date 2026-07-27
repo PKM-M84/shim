@@ -840,7 +840,19 @@ fn classify(pattern: &str) -> bool {
     // Structural indicators
     let has_mixed_case = raw.chars().any(|c| c.is_uppercase()) && raw.chars().any(|c| c.is_lowercase());
     let has_snake = raw.contains('_');
-    let has_structural = raw.contains('.') || raw.contains("::")
+    // A dot signals structure (`obj.method`, `app.current_tenant_id`) only when it
+    // sits BETWEEN identifier characters. A leading or trailing dot is a dotfile or
+    // extension literal (`\.env`, `\.gitignore`) — a text search. Escaping used to
+    // make these safe by accident, before literal_form existed.
+    let chars: Vec<char> = raw.chars().collect();
+    let has_interior_dot = chars.iter().enumerate().any(|(i, &c)| {
+        c == '.'
+            && i > 0
+            && i + 1 < chars.len()
+            && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_')
+            && (chars[i + 1].is_alphanumeric() || chars[i + 1] == '_')
+    });
+    let has_structural = has_interior_dot || raw.contains("::")
         || raw.contains("->") || raw.contains('(') || raw.contains(')');
     let has_space = raw.contains(' ');
 
@@ -1978,6 +1990,26 @@ mod tests {
     #[test]
     fn escaped_dot_is_structural() {
         assert!(classify(r"app\.current_tenant_id"));
+    }
+
+    #[test]
+    fn a_leading_dot_literal_is_not_structural() {
+        // `rg '\.env'` is a dotfile/extension text search. Escaping used to make
+        // this safe by accident; the dot heuristic must now reject it explicitly.
+        assert!(!classify(r"\.env"));
+        assert!(!classify(r"\.gitignore"));
+        assert!(!classify(r"\.log"));
+    }
+
+    #[test]
+    fn a_trailing_dot_literal_is_not_structural() {
+        assert!(!classify(r"env\."));
+    }
+
+    #[test]
+    fn an_interior_dot_is_still_structural() {
+        assert!(classify(r"app\.current_tenant_id"));
+        assert!(classify("app.current_tenant_id"));
     }
 
     #[test]
