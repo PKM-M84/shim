@@ -168,6 +168,8 @@ struct RgInvocation {
     // The first flag found whose SEMANTICS ast-grep cannot reproduce. Set → the
     // whole call must go to real rg (see UNSUPPORTED_LONG / unsupported_short).
     unsupported: Option<String>,
+    /// `--no-smart`: force plain ripgrep, no structural filtering.
+    no_smart: bool,
     // -n/--line-number → Some(true), -N/--no-line-number → Some(false), unset →
     // None, meaning rg's own default (on for a TTY, off when piped).
     line_numbers: Option<bool>,
@@ -227,6 +229,15 @@ fn short_takes_value(c: char) -> bool {
     matches!(c, 'e' | 't' | 'T' | 'g' | 'm' | 'A' | 'B' | 'C' | 'M' | 'j' | 'f' | 'r' | 'E' | 'd')
 }
 
+/// Remove flags that belong to the shim rather than ripgrep.
+///
+/// `--no-smart` is ours; forwarding it would make rg exit with a usage error.
+/// The parser deliberately treats unknown flags as harmless booleans (right for
+/// real rg flags, wrong for this one), so it needs removing explicitly.
+fn strip_shim_flags(args: &[String]) -> Vec<String> {
+    args.iter().filter(|a| a.as_str() != "--no-smart").cloned().collect()
+}
+
 fn parse_rg_invocation(args: &[String]) -> RgInvocation {
     let mut inv = RgInvocation { path: ".".into(), ..Default::default() };
     let mut positionals: Vec<String> = Vec::new();
@@ -267,6 +278,7 @@ fn parse_rg_invocation(args: &[String]) -> RgInvocation {
                 "files" | "type-list" => inv.pattern_less = true,
                 "line-number" => inv.line_numbers = Some(true),
                 "no-line-number" => inv.line_numbers = Some(false),
+                "no-smart" => inv.no_smart = true,
                 _ => {}
             }
             i += 1;
@@ -2559,5 +2571,31 @@ mod tests {
         let m = parse_rg_json(&stream);
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].text, "const deviceId = 1;", "no trailing \\r");
+    }
+
+    // ── --no-smart: ours, not ripgrep's ──
+
+    #[test]
+    fn no_smart_is_detected_without_eating_the_pattern() {
+        let inv = parse(&["--no-smart", "deviceId", "src"]);
+        assert!(inv.no_smart);
+        assert_eq!(inv.pattern.as_deref(), Some("deviceId"));
+        assert_eq!(inv.path, "src");
+    }
+
+    #[test]
+    fn no_smart_defaults_off() {
+        assert!(!parse(&["deviceId", "src"]).no_smart);
+    }
+
+    #[test]
+    fn strip_shim_flags_removes_only_our_flag() {
+        let args: Vec<String> = ["-n", "--no-smart", "deviceId", "src"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            strip_shim_flags(&args),
+            vec!["-n".to_string(), "deviceId".to_string(), "src".to_string()],
+            "rg would reject --no-smart"
+        );
     }
 }
