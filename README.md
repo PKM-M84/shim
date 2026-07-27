@@ -1,6 +1,6 @@
 # shim 🪶
 
-> Drop-in `rg` replacement that silently redirects structural code searches to ast-grep — and tracks how many files, tokens, and dollars it saves you. Saves 50–90% of search tokens. ~2MB binary, bundled SQLite, zero config.
+> Drop-in `rg` replacement that runs real ripgrep, then uses ast-grep to strip the matches that aren't real code — and tracks how many files, tokens, and dollars it saves you. Saves 50–90% of search tokens. ~2MB binary, bundled SQLite, zero config.
 
 > ## 🖥️ Works with terminal CLI agents only — not the desktop or web app
 >
@@ -28,7 +28,9 @@
 
 When your AI coding assistant (Claude Code, Cursor, etc.) searches your code for something like `useState(`, it uses a tool called **ripgrep** (`rg`). ripgrep is fast, but it's dumb — it can't tell the difference between a real `useState()` call in your code and the word "useState" in a comment, a string, or documentation. So it finds 500+ matches when only 60 are real. Your AI opens all 500 files. You pay for all those tokens.
 
-**shim fixes this.** It's a tiny program that pretends to be ripgrep. When your AI calls it, shim quietly checks: "Is this a code pattern or just text?" If it's code, shim sends it to **ast-grep** instead — a smarter tool that actually understands code structure. If it's just text, shim passes it through to real ripgrep. Your AI never knows the difference. You save tokens — and shim records every redirect so you can see the savings (`smart-rg stats` / `smart-rg report`).
+**shim fixes this.** It's a tiny program that pretends to be ripgrep. When your AI calls it, shim runs **real ripgrep first** — so you always start from ripgrep's complete, correct answer. Then, if the pattern looks like code, it asks **ast-grep** — a tool that actually understands code structure — which of those hits are real code rather than comments, strings, or docs. The noise is filtered out; everything ast-grep can't vouch for is kept. Your AI never knows the difference. You save tokens — and shim records every search so you can see the savings (`smart-rg stats` / `smart-rg report`).
+
+The order matters: ripgrep goes first because it can never come back wrongly empty. ast-grep only ever *removes* noise from an answer that was already right — it is never the thing that finds your results.
 
 ### I just want it to work. What do I do?
 
@@ -82,13 +84,21 @@ That's it. Your AI is now using smarter search, and shim is counting the savings
 
 ### How do I know it's working?
 
-When shim redirects a search, you'll see a cyan message on stderr:
+When shim filters noise out of a search, you'll see a cyan message on stderr:
 
 ```
-🔀 smart-rg → ast-grep (typescript)  pattern: 'useState($$$)'
+smart-rg: 3 matches not confirmed as structural by ast-grep — rerun with --no-smart
 ```
 
-No message = shim passed the search straight to real ripgrep (which is fine — some searches really are just text).
+That's shim telling you exactly what it hid, so a filtered result is never a silent one. Want them back? Add `--no-smart` and you get ripgrep's raw output, unfiltered:
+
+```bash
+rg --no-smart 'useState\(' src/
+```
+
+No message = nothing was filtered. Either the search was plain text and went straight to ripgrep, or every hit was real code. Both are fine.
+
+Shim never hides a hit it couldn't check. If a file's language has no ast-grep grammar — `.sql`, `.md`, an unmapped extension — or ast-grep can't parse that language's call syntax, those hits are passed through untouched. It only filters what it actually looked at.
 
 ---
 
@@ -148,7 +158,7 @@ If `USE_BUILTIN_RIPGREP=0` is set in Claude Code's environment, it bypasses the 
 
 ### The Fix
 
-We built **shim** — a Rust binary that *is* `rg` as far as Claude Code is concerned. Same CLI contract. Same output format. But internally: it classifies every search as structural or textual. Structural patterns go to ast-grep. Everything else passes through to real ripgrep. And every redirect is logged to a local SQLite database so the savings are measurable, not theoretical.
+We built **shim** — a Rust binary that *is* `rg` as far as Claude Code is concerned. Same CLI contract. Same output format. But internally: it runs real ripgrep first, then uses ast-grep to strip the hits that aren't real code. Plain-text searches never go near ast-grep at all. And every search is logged to a local SQLite database so the savings are measurable, not theoretical.
 
 No agent consent required. No model retraining. Just: `USE_BUILTIN_RIPGREP=0` and put shim where `rg` lives.
 
@@ -157,24 +167,59 @@ No agent consent required. No model retraining. Just: `USE_BUILTIN_RIPGREP=0` an
 ## How It Works
 
 ```
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│  Claude Code  │────→│     shim     │────→│   ast-grep   │  (structural)
-│  (or any tool)│     │  classifies  │     │              │
-│  calls `rg`   │     │  pattern     │────→│   real rg    │  (text search)
-└──────────────┘     └──────┬───────┘     └──────────────┘
-                            │ logs every call + rg-vs-ast comparison
-                            ▼
+┌───────────────┐     ┌──────────────┐
+│  Claude Code  │────→│     shim     │
+│  (or any tool)│     │              │
+│  calls `rg`   │     └──────┬───────┘
+└───────────────┘            │
+                             │  plain text? unsupported flag? ─→ real rg, verbatim
+                             │
+                             ▼  structural pattern:
+                    ┌────────────────────┐
+                    │  1. real rg --json │  ground truth — can never be wrongly empty
+                    └─────────┬──────────┘
+                              │  no hits ─→ done (ast-grep never spawns)
+                              ▼
+                    ┌────────────────────┐
+                    │  2. ast-grep, once │  over ONLY the files rg hit,
+                    │     per language   │  one pass per language present
+                    └─────────┬──────────┘
+                              ▼
+                    ┌────────────────────┐
+                    │  3. keep confirmed │  + everything ast-grep couldn't check
+                    │     hits           │  suppressed count → stderr
+                    └─────────┬──────────┘
+                              │ logs the search + an exact rg-vs-ast comparison
+                              ▼
                      ~/.smart-rg/stats.db  →  smart-rg stats / report
 ```
 
-1. **Classify** — Strip rg regex escapes, analyze the pattern. Function call? Keyword? Structural construct? Or complex regex that needs real ripgrep?
-2. **Translate** — `console.log(` → `console.log($$$)`; `useState` → `useState`; `async function` → `async function $$$($$$) { $$$ }`.
-3. **Execute** — Run ast-grep with `--json=stream`, parse the AST match data.
-4. **Reformat** — Rewrite ast-grep's JSON to `file:line:content` — the exact format rg produces and Claude Code's parser expects.
-5. **Measure** — Record the search (and a head-to-head rg-vs-ast comparison) to SQLite for the savings report.
-6. **Fall back** — If anything goes wrong (ast-grep fails, pattern can't be translated, unrecognized flags), shim silently falls through to real ripgrep. The agent never knows.
+1. **Classify** — Reduce rg escapes to literal text and analyze the pattern. A function call, an identifier, a structural construct? Or a regex — alternation, character classes, assertions — that only ripgrep can answer? Text searches pass straight through and never touch ast-grep.
+2. **Search for real** — Run ripgrep with `--json`, keeping the caller's filters (`-g`, `--type`, paths). This is the answer. If ripgrep finds nothing, shim prints nothing and exits 1 — ast-grep is never spawned for a search that was always going to be empty.
+3. **Group by what actually matched** — Take the files ripgrep hit and group them by their own extension. Language comes from the results, not from a guess about the directory — which is what used to make a symbol in a polyglot repo invisible.
+4. **Confirm** — Run ast-grep once per language, over only those files, and keep a ripgrep hit when a confirmed syntax node **contains** its line. Multi-line calls count: an argument on a continuation line is still inside the call.
+5. **Keep what wasn't checked** — A language with no ast-grep grammar, or one whose grammar can't express the pattern, confirms nothing — so its files are treated as never searched and their hits are kept in full. Shim only filters what it actually looked at.
+6. **Report honestly** — Print the confirmed hits; announce the suppressed count on stderr with `--no-smart` as the way back. Log the search and an exact rg-vs-ast comparison to SQLite, counting only the files ast-grep really examined.
+
+**Why ripgrep goes first.** In the original design ast-grep answered the query and ripgrep was the fallback — so whenever ast-grep guessed the language wrong, or the pattern didn't parse in that grammar, the agent got a confident empty result that looked exactly like a real no-match. Inverting it makes that failure impossible: ripgrep's answer is always the floor, and ast-grep can only ever subtract from it.
 
 ---
+
+## Searching with shim
+
+Shim accepts ripgrep's flags and prints ripgrep's output format — that's the whole point, and it's what lets an agent use it without knowing. Two things are worth knowing as a human:
+
+| | |
+|---|---|
+| `--no-smart` | Shim's own flag. Turns filtering off for one search and gives you ripgrep's raw output. It's the remedy the stderr notice points at, and it's stripped before forwarding so ripgrep never sees a flag it doesn't recognise. |
+| flags shim can't honour | Some flags change *which* lines match in a way ast-grep has no equivalent for — `-v`, `-A`/`-B`/`-C`, `-o`, `-m`, `-i`, `-F`, `-r`, `-q`, `--json`, `--vimgrep`, `--passthru`, `--files-without-match`, multiple `-e` patterns, and `-f`. Those searches go straight to real ripgrep, verbatim. You get the correct answer; you just don't get filtering for that call. |
+
+```bash
+rg 'useState\(' src/            # filtered: real calls, no comment/string noise
+rg --no-smart 'useState\(' src/ # raw ripgrep, everything
+rg -v useState src/             # passthrough — invert has no structural equivalent
+smart-rg --version              # the shim's version (as `rg`, --version reports ripgrep's)
+```
 
 ## Stats & Reports
 
@@ -339,9 +384,10 @@ bash tests/install_test.sh
 ## Safety
 
 - **Zero data leaves your machine.** No phone-home, no analytics, local SQLite only.
-- **Graceful fallback.** Any error, unrecognized pattern, or unhandled flag → falls through to real ripgrep. The search always completes.
+- **Ripgrep's answer is the floor.** Real ripgrep runs first, so a search can never come back wrongly empty. ast-grep only removes noise from an answer that was already correct — any error, unparseable pattern, or unhandled flag means you simply get ripgrep's full output.
+- **Never hides what it didn't check.** Files whose language ast-grep has no grammar for, or whose grammar can't express the pattern, are passed through untouched rather than treated as noise.
 - **Opt-in.** Active only when `USE_BUILTIN_RIPGREP=0` (Claude Code) or when placed first in PATH. Remove either and you're back to stock ripgrep.
-- **Transparent.** The `🔀 smart-rg → ast-grep` line prints to stderr so you can see redirects. Pass-throughs are silent.
+- **Transparent.** Whenever shim hides anything it says so on stderr, with the suppressed count and `--no-smart` to get it back. Silence means nothing was filtered.
 
 ---
 
@@ -349,7 +395,7 @@ bash tests/install_test.sh
 
 Benchmarked on agentvault-gen2 (1,095 TS files, M2 Mac mini):
 
-| Operation | real rg | shim (redirected) |
+| Operation | real rg | shim (filtered) |
 |---|---|---|
 | `useState(` search | ~30ms | ~70ms |
 | `console.log(` search | ~30ms | ~70ms |
@@ -374,7 +420,7 @@ Redirection adds ~40ms (ast-grep's JSON output is larger). For the token savings
 
 ## Contributing
 
-Found a pattern that should redirect but doesn't? Check `smart-rg stats` for recent pass-throughs, then open an issue/PR with the pattern. Welcome.
+Found a pattern that should be filtered but isn't? Check `smart-rg stats` for recent pass-throughs and fallbacks, then open an issue/PR with the pattern. Welcome.
 
 ## License
 
