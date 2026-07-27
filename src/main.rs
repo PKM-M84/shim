@@ -201,6 +201,9 @@ const UNSUPPORTED_LONG: &[&str] = &[
     "fixed-strings", "replace",
     // output shapes the shim does not emit
     "quiet", "json",
+    // vimgrep wants file:line:COLUMN:text (shim does not emit COLUMN)
+    // passthru wants every line; under --json those are context records that parse_rg_json discards
+    "vimgrep", "passthru",
 ];
 
 // Short forms of the same set. Case matters: `-c` (count) is supported,
@@ -1184,6 +1187,14 @@ enum RgCapture {
     Failed,
 }
 
+/// Short flags that select an OUTPUT MODE. These must never reach the internal
+/// `--json` run: ripgrep's mode precedence lets `-c`/`-l` beat `--json` no
+/// matter where it sits in the argv, so the capture would come back as plain
+/// text, parse to zero matches, and look exactly like a genuine no-match.
+fn is_output_mode_short(c: char) -> bool {
+    matches!(c, 'c' | 'l' | 'n' | 'N')
+}
+
 /// Build the argv for the internal ripgrep run: the caller's FILTER flags are
 /// kept (`-g`, `--type`, `-w`, the pattern, the paths) and OUTPUT-MODE flags are
 /// dropped, because we render the shape ourselves from the filtered set.
@@ -1193,15 +1204,23 @@ enum RgCapture {
 fn rg_capture_args(original: &[String]) -> Vec<String> {
     let mut out = vec!["--json".to_string()];
     for arg in original {
+        // Long-form output-mode flags: exact token match.
         if matches!(
             arg.as_str(),
-            "-c" | "--count" | "--count-matches"
-                | "-l" | "--files-with-matches"
-                | "-n" | "--line-number" | "-N" | "--no-line-number"
+            "--count" | "--count-matches" | "--files-with-matches"
+                | "--line-number" | "--no-line-number"
                 | "--heading" | "--no-heading"
                 | "--json"
         ) {
             continue;
+        }
+        // Short-flag tokens may be BUNDLED (`-nc`, `-cl`). Test every character,
+        // not the whole token — exact-token matching missed these entirely.
+        // Bare `-` is ripgrep's stdin marker, not a flag.
+        if arg.len() >= 2 && arg.starts_with('-') && !arg.starts_with("--") {
+            if arg.chars().skip(1).any(is_output_mode_short) {
+                continue;
+            }
         }
         out.push(arg.clone());
     }
@@ -2782,5 +2801,38 @@ mod tests {
     fn rg_capture_args_keep_the_type_filter() {
         let out = rg_capture_args(&strs(&["--type", "ts", "deviceId", "src"]));
         assert!(out.windows(2).any(|w| w == ["--type".to_string(), "ts".to_string()]));
+    }
+
+    #[test]
+    fn rg_capture_args_strip_bundled_short_output_flags() {
+        // `-nc` is ordinary ripgrep usage. Exact-token matching missed it, and
+        // rg's mode precedence let -c beat --json, so the capture came back as
+        // plain text and parsed to a silent false-empty.
+        let out = rg_capture_args(&strs(&["-nc", "deviceId", "src"]));
+        assert!(!out.iter().any(|a| a == "-nc"), "bundled -nc must be stripped");
+        assert!(out.contains(&"--json".to_string()));
+        assert!(out.contains(&"deviceId".to_string()));
+        assert!(out.contains(&"src".to_string()));
+    }
+
+    #[test]
+    fn rg_capture_args_strip_bundled_cl() {
+        let out = rg_capture_args(&strs(&["-cl", "deviceId", "src"]));
+        assert!(!out.iter().any(|a| a == "-cl"), "bundled -cl must be stripped");
+    }
+
+    #[test]
+    fn rg_capture_args_keep_a_bare_dash_stdin_marker() {
+        let out = rg_capture_args(&strs(&["deviceId", "-"]));
+        assert!(out.contains(&"-".to_string()), "a bare - is stdin, not a flag");
+    }
+
+    #[test]
+    fn vimgrep_and_passthru_force_passthrough() {
+        // --vimgrep wants file:line:COLUMN:text, which the shim does not emit.
+        // --passthru wants every line; under --json those are `context` records
+        // that parse_rg_json discards. Both are correct only via real rg.
+        assert_eq!(parse(&["--vimgrep", "deviceId", "src"]).unsupported.as_deref(), Some("--vimgrep"));
+        assert_eq!(parse(&["--passthru", "deviceId", "src"]).unsupported.as_deref(), Some("--passthru"));
     }
 }
