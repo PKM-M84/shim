@@ -1126,6 +1126,9 @@ fn parse_rg_json(stdout: &str) -> Vec<RgMatch> {
 struct AgMatch {
     file: String,
     line: u64,
+    /// Last line of the node (1-based, inclusive). A node may span several
+    /// lines; see `is_confirmed`.
+    end_line: u64,
     text: String,
 }
 
@@ -1162,6 +1165,13 @@ fn parse_ag_matches(stdout: &str) -> Vec<AgMatch> {
                     .and_then(|l| l.as_u64())
                     .unwrap_or(0)
                     + 1,
+                end_line: v
+                    .get("range")
+                    .and_then(|r| r.get("end"))
+                    .and_then(|e| e.get("line"))
+                    .and_then(|l| l.as_u64())
+                    .unwrap_or(0)
+                    + 1,
                 text: v
                     .get("lines")
                     .and_then(|l| l.as_str())
@@ -1171,6 +1181,26 @@ fn parse_ag_matches(stdout: &str) -> Vec<AgMatch> {
             })
         })
         .collect()
+}
+
+/// Line spans (1-based, inclusive) ast-grep confirmed, keyed by file.
+fn confirmed_spans(matches: &[AgMatch]) -> HashMap<&str, Vec<(u64, u64)>> {
+    let mut spans: HashMap<&str, Vec<(u64, u64)>> = HashMap::new();
+    for m in matches {
+        spans.entry(m.file.as_str()).or_default().push((m.line, m.end_line));
+    }
+    spans
+}
+
+/// Is this ripgrep hit inside a node ast-grep confirmed?
+///
+/// CONTAINMENT, not equality. ripgrep reports every matching line; ast-grep
+/// reports one span per node. Comparing against the node's start line alone
+/// silently drops hits on continuation lines of a multi-line call.
+fn is_confirmed(hit: &RgMatch, spans: &HashMap<&str, Vec<(u64, u64)>>) -> bool {
+    spans
+        .get(hit.file.as_str())
+        .is_some_and(|v| v.iter().any(|&(start, end)| hit.line >= start && hit.line <= end))
 }
 
 /// Render matches in ripgrep's output shape for the requested mode. Files are
@@ -2233,9 +2263,56 @@ mod tests {
     // ── output fidelity: line numbers and -c format must match ripgrep ──
 
     fn ag_json(file: &str, line: u64, text: &str) -> String {
+        ag_json_span(file, line, line, text)
+    }
+
+    fn ag_json_span(file: &str, start: u64, end: u64, text: &str) -> String {
         format!(
-            r#"{{"file":"{file}","range":{{"start":{{"line":{line}}}}},"lines":"{text}"}}"#
+            r#"{{"file":"{file}","range":{{"start":{{"line":{start}}},"end":{{"line":{end}}}}},"lines":"{text}"}}"#
         )
+    }
+
+    // ── containment, not equality ──
+    //
+    // A structural node can span several lines while ripgrep reports each
+    // matching line separately:
+    //
+    //   result = bypass_rls(        <- rg hits; ast-grep node STARTS here
+    //       session, tenant_id      <- rg ALSO hits here for `tenant_id`
+    //   )
+    //
+    // Confirming on the start line alone silently drops the second hit — the
+    // same silent-drop shape as v0.3.9, v0.3.10 and v0.3.12.
+
+    #[test]
+    fn ast_grep_end_line_is_normalised_to_one_based() {
+        let m = parse_ag_matches(&ag_json_span("a.py", 0, 2, "bypass_rls("));
+        assert_eq!(m[0].line, 1);
+        assert_eq!(m[0].end_line, 3);
+    }
+
+    #[test]
+    fn a_hit_on_a_continuation_line_is_confirmed() {
+        let ag = parse_ag_matches(&ag_json_span("a.py", 0, 2, "bypass_rls("));
+        let spans = confirmed_spans(&ag);
+        let hit = RgMatch { file: "a.py".into(), line: 2, text: "  session, tenant_id".into() };
+        assert!(is_confirmed(&hit, &spans), "line 2 is inside the node span 1..=3");
+    }
+
+    #[test]
+    fn a_hit_outside_every_span_is_dropped() {
+        let ag = parse_ag_matches(&ag_json_span("a.py", 0, 2, "bypass_rls("));
+        let spans = confirmed_spans(&ag);
+        let hit = RgMatch { file: "a.py".into(), line: 9, text: "# bypass_rls in a comment".into() };
+        assert!(!is_confirmed(&hit, &spans));
+    }
+
+    #[test]
+    fn a_hit_in_an_unconfirmed_file_is_dropped() {
+        let ag = parse_ag_matches(&ag_json_span("a.py", 0, 2, "bypass_rls("));
+        let spans = confirmed_spans(&ag);
+        let hit = RgMatch { file: "other.sql".into(), line: 1, text: "-- bypass_rls".into() };
+        assert!(!is_confirmed(&hit, &spans));
     }
 
     #[test]
