@@ -170,6 +170,10 @@ struct RgInvocation {
     unsupported: Option<String>,
     /// `--no-smart`: force plain ripgrep, no structural filtering.
     no_smart: bool,
+    // Indices into the args slice of tokens that belong to the SHIM, not to
+    // ripgrep, and must never be forwarded. Recorded by the parser so the
+    // stripper cannot disagree with it about `--` or value-taking flags.
+    shim_flag_indices: Vec<usize>,
     // -n/--line-number → Some(true), -N/--no-line-number → Some(false), unset →
     // None, meaning rg's own default (on for a TTY, off when piped).
     line_numbers: Option<bool>,
@@ -229,13 +233,19 @@ fn short_takes_value(c: char) -> bool {
     matches!(c, 'e' | 't' | 'T' | 'g' | 'm' | 'A' | 'B' | 'C' | 'M' | 'j' | 'f' | 'r' | 'E' | 'd')
 }
 
-/// Remove flags that belong to the shim rather than ripgrep.
+/// Remove tokens that belong to the shim rather than ripgrep.
 ///
-/// `--no-smart` is ours; forwarding it would make rg exit with a usage error.
-/// The parser deliberately treats unknown flags as harmless booleans (right for
-/// real rg flags, wrong for this one), so it needs removing explicitly.
-fn strip_shim_flags(args: &[String]) -> Vec<String> {
-    args.iter().filter(|a| a.as_str() != "--no-smart").cloned().collect()
+/// Driven by indices the PARSER recorded, never by matching strings. A blind
+/// string filter disagrees with ripgrep's grammar in two ways that both
+/// corrupt the user's search: it deletes a literal `--no-smart` appearing
+/// after `--` (where ripgrep says everything is positional), and it deletes
+/// the token when it is the VALUE of a preceding flag such as `-e`.
+fn strip_shim_flags(args: &[String], shim_indices: &[usize]) -> Vec<String> {
+    args.iter()
+        .enumerate()
+        .filter(|(i, _)| !shim_indices.contains(i))
+        .map(|(_, a)| a.clone())
+        .collect()
 }
 
 fn parse_rg_invocation(args: &[String]) -> RgInvocation {
@@ -245,6 +255,7 @@ fn parse_rg_invocation(args: &[String]) -> RgInvocation {
     let mut i = 0;
 
     while i < args.len() {
+        let token_start = i;
         let a = &args[i];
 
         // Everything after `--` is positional, verbatim.
@@ -278,7 +289,10 @@ fn parse_rg_invocation(args: &[String]) -> RgInvocation {
                 "files" | "type-list" => inv.pattern_less = true,
                 "line-number" => inv.line_numbers = Some(true),
                 "no-line-number" => inv.line_numbers = Some(false),
-                "no-smart" => inv.no_smart = true,
+                "no-smart" => {
+                    inv.no_smart = true;
+                    inv.shim_flag_indices.push(token_start);
+                }
                 _ => {}
             }
             i += 1;
@@ -1893,6 +1907,10 @@ mod tests {
         parse_rg_invocation(&owned)
     }
 
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
     fn explicit_e_flag_is_the_pattern_and_positionals_are_paths() {
         let inv = parse(&["-e", "useState(", "--type", "ts", "."]);
@@ -2590,12 +2608,45 @@ mod tests {
 
     #[test]
     fn strip_shim_flags_removes_only_our_flag() {
-        let args: Vec<String> = ["-n", "--no-smart", "deviceId", "src"]
-            .iter().map(|s| s.to_string()).collect();
+        let inv = parse(&["-n", "--no-smart", "deviceId", "src"]);
+        let args = strs(&["-n", "--no-smart", "deviceId", "src"]);
         assert_eq!(
-            strip_shim_flags(&args),
-            vec!["-n".to_string(), "deviceId".to_string(), "src".to_string()],
+            strip_shim_flags(&args, &inv.shim_flag_indices),
+            strs(&["-n", "deviceId", "src"]),
             "rg would reject --no-smart"
         );
+    }
+
+    #[test]
+    fn no_smart_after_double_dash_is_a_pattern_not_a_flag() {
+        // `rg -- --no-smart` searches for that literal text. Stripping it left a
+        // bare `rg --`, which fails with "required argument <PATTERN>".
+        let inv = parse(&["--", "--no-smart", "src"]);
+        assert_eq!(inv.pattern.as_deref(), Some("--no-smart"));
+        assert!(!inv.no_smart);
+        let args = strs(&["--", "--no-smart", "src"]);
+        assert_eq!(strip_shim_flags(&args, &inv.shim_flag_indices), args,
+            "nothing after -- may be stripped");
+    }
+
+    #[test]
+    fn no_smart_as_a_flag_value_is_not_stripped() {
+        // `-e --no-smart src` searches for that literal in src. Stripping the
+        // value silently turned this into "search for src in the cwd".
+        let inv = parse(&["-e", "--no-smart", "src"]);
+        assert_eq!(inv.pattern.as_deref(), Some("--no-smart"));
+        assert!(!inv.no_smart);
+        let args = strs(&["-e", "--no-smart", "src"]);
+        assert_eq!(strip_shim_flags(&args, &inv.shim_flag_indices), args,
+            "-e's value must survive");
+    }
+
+    #[test]
+    fn no_smart_with_an_inline_value_is_stripped() {
+        let inv = parse(&["--no-smart=true", "deviceId", "src"]);
+        assert!(inv.no_smart);
+        let args = strs(&["--no-smart=true", "deviceId", "src"]);
+        assert_eq!(strip_shim_flags(&args, &inv.shim_flag_indices),
+            strs(&["deviceId", "src"]), "the =value spelling must strip too");
     }
 }
