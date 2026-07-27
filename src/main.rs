@@ -1169,6 +1169,73 @@ fn parse_rg_json(stdout: &str) -> Vec<RgMatch> {
         .collect()
 }
 
+/// Above this many matches, stop filtering and render ripgrep's output as-is.
+/// The shim already buffers ast-grep's JSON, so capturing is not new in kind —
+/// but ripgrep matches more, so it is new in degree.
+const MATCH_CAP: usize = 10_000;
+
+enum RgCapture {
+    /// Within the cap — eligible for structural filtering.
+    Matches(Vec<RgMatch>),
+    /// Too many to filter; render as-is. Note we still hold the matches:
+    /// re-running ripgrep would reintroduce the double-run this design removes.
+    OverCap(Vec<RgMatch>),
+    /// ripgrep could not be run, or failed. Caller should passthrough.
+    Failed,
+}
+
+/// Build the argv for the internal ripgrep run: the caller's FILTER flags are
+/// kept (`-g`, `--type`, `-w`, the pattern, the paths) and OUTPUT-MODE flags are
+/// dropped, because we render the shape ourselves from the filtered set.
+///
+/// Dropping `-n`/`-N` loses nothing: the caller's preference is already recorded
+/// on `RgInvocation.line_numbers` and rendering reads it from there.
+fn rg_capture_args(original: &[String]) -> Vec<String> {
+    let mut out = vec!["--json".to_string()];
+    for arg in original {
+        if matches!(
+            arg.as_str(),
+            "-c" | "--count" | "--count-matches"
+                | "-l" | "--files-with-matches"
+                | "-n" | "--line-number" | "-N" | "--no-line-number"
+                | "--heading" | "--no-heading"
+                | "--json"
+        ) {
+            continue;
+        }
+        out.push(arg.clone());
+    }
+    out
+}
+
+/// Run the real ripgrep and capture its matches. ripgrep exits 1 on "no
+/// matches", which is a normal empty result, not a failure — only a spawn
+/// failure or an exit code above 1 is treated as `Failed`.
+fn run_rg_capture(original: &[String]) -> RgCapture {
+    let rg = match real_rg_path() {
+        Some(p) => p,
+        None => return RgCapture::Failed,
+    };
+    let output = match Command::new(&rg)
+        .args(rg_capture_args(original))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return RgCapture::Failed,
+    };
+    if output.status.code().unwrap_or(2) > 1 {
+        return RgCapture::Failed;
+    }
+    let matches = parse_rg_json(&String::from_utf8_lossy(&output.stdout));
+    if matches.len() > MATCH_CAP {
+        RgCapture::OverCap(matches)
+    } else {
+        RgCapture::Matches(matches)
+    }
+}
+
 #[derive(Debug, PartialEq)]
 struct AgMatch {
     file: String,
@@ -2693,5 +2760,27 @@ mod tests {
         let groups = group_files_by_lang(&strs(&["b.ts", "a.py"]));
         let langs: Vec<&str> = groups.keys().copied().collect();
         assert_eq!(langs, vec!["python", "typescript"], "BTreeMap orders by language");
+    }
+
+    // ── capturing rg: strip output-mode flags, keep filters ──
+
+    #[test]
+    fn rg_capture_args_strip_output_modes_and_add_json() {
+        let args = strs(&["-c", "-n", "--heading", "-g", "*.ts", "deviceId", "src"]);
+        let out = rg_capture_args(&args);
+        assert!(out.contains(&"--json".to_string()));
+        for stripped in ["-c", "-n", "--heading"] {
+            assert!(!out.contains(&stripped.to_string()), "{stripped} must be stripped");
+        }
+        // Filters and positionals survive, in order.
+        assert!(out.windows(2).any(|w| w == ["-g".to_string(), "*.ts".to_string()]));
+        assert!(out.contains(&"deviceId".to_string()));
+        assert!(out.contains(&"src".to_string()));
+    }
+
+    #[test]
+    fn rg_capture_args_keep_the_type_filter() {
+        let out = rg_capture_args(&strs(&["--type", "ts", "deviceId", "src"]));
+        assert!(out.windows(2).any(|w| w == ["--type".to_string(), "ts".to_string()]));
     }
 }
