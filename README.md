@@ -225,7 +225,8 @@ smart-rg --version              # the shim's version (as `rg`, --version reports
 
 [![smart-rg HTML savings report — files, tokens, and cost saved per pattern](docs/report-preview.png)](docs/report-preview.png)
 
-> `smart-rg report -o report.html --open` — a self-contained HTML dashboard of **real** rg-vs-ast-grep savings.
+> `smart-rg report -o report.html --open` — a self-contained HTML dashboard of your own rg-vs-ast-grep savings.
+> *(Screenshot uses a synthetic demo dataset — the real one is local to your machine and never leaves it.)*
 
 shim logs every search to a local SQLite database (`~/.smart-rg/stats.db`, created automatically) and turns it into savings numbers.
 
