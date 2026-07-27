@@ -1,9 +1,18 @@
 // smart-rg: A drop-in rg replacement that redirects structural code searches
 // to ast-grep. Claude Code / Hermes / any coding agent compatible.
 //
-// Architecture:
-//   Input (rg flags) → Classify pattern → Structural? → ast-grep → Reformat → Output
-//                                       → Text?       → real rg  → Output
+// Architecture: ripgrep runs FIRST, as ground truth — it can never be silently
+// empty. ast-grep then FILTERS those hits down to the structural ones, once
+// per language actually present in the matched files.
+//
+//   Input (rg flags) → Classify pattern → Structural? → rg (captured, ground truth)
+//                                                          → ast-grep filters, per language
+//                                                          → Output (confirmed ∪ unsearched)
+//                                       → Text?          → real rg → Output
+//
+// A hit is kept when ast-grep confirmed it, OR when its file/language was
+// never actually searched (unmapped extension, or ast-grep found nothing at
+// all for that language — indistinguishable from a spawn/grammar failure).
 //
 // Stats:  smart-rg stats [--json]
 //         smart-rg report [-o path.html]
@@ -622,6 +631,10 @@ fn main() {
             log_event("passthrough", &pattern, "rg_failed", None, 0);
             exec_real_rg(&rg_args);
         }
+        RgCapture::Unparseable => {
+            log_event("passthrough", &pattern, "rg_json_unparseable", None, 0);
+            exec_real_rg(&rg_args);
+        }
         RgCapture::OverCap(hits) => {
             // rg already ran — render what we have. Re-running it would
             // reintroduce the double-execution this design removes.
@@ -653,16 +666,22 @@ fn main() {
     }
 
     let sg_pattern = translate_pattern(&pattern);
-    let searched: HashSet<String> = by_lang
-        .values()
-        .flatten()
-        .map(|f| norm_path(f.as_str()).to_string())
-        .collect();
 
     let ag_start = Instant::now();
     let mut ag: Vec<AgMatch> = Vec::new();
+    let mut searched: HashSet<String> = HashSet::new();
     for (lang, lang_files) in &by_lang {
-        ag.extend(run_ast_grep_on_files(&sg_pattern, lang, lang_files));
+        let found = run_ast_grep_on_files(&sg_pattern, lang, lang_files);
+        if found.is_empty() {
+            // This language confirmed NOTHING. Either ast-grep failed, or the
+            // grammar was wrong for these files — and those are indistinguishable,
+            // because a wrong-grammar run exits 1 with no output and NO stderr.
+            // Treat the whole language as NOT SEARCHED so its hits are kept.
+            // Errs toward showing a comment, never toward dropping a real call.
+            continue;
+        }
+        searched.extend(lang_files.iter().map(|f| norm_path(f.as_str()).to_string()));
+        ag.extend(found);
     }
     let ag_time_ms = ag_start.elapsed().as_millis() as u64;
     let lang_label = by_lang.keys().copied().collect::<Vec<&str>>().join(",");
@@ -1074,20 +1093,28 @@ struct RgMatch {
     text: String,
 }
 
-/// Parse ripgrep's `--json` event stream (one JSON object per line), keeping
-/// only `match` records.
+/// Parse ripgrep's `--json` event stream, returning the matches and a count of
+/// `match` records that could NOT be parsed.
 ///
 /// `--json` is used rather than `path:line:text` because a path may itself
-/// contain a colon. Paths that are not valid UTF-8 arrive as a `bytes` field
-/// instead of `text` and are skipped — they cannot be handed to ast-grep anyway.
-fn parse_rg_json(stdout: &str) -> Vec<RgMatch> {
-    stdout
-        .lines()
-        .filter_map(|line| {
-            let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
-            if v.get("type")?.as_str()? != "match" {
-                return None;
-            }
+/// contain a colon. ripgrep emits `lines.bytes` (base64) instead of
+/// `lines.text` when a matching line is not valid UTF-8, and `path.bytes` for
+/// non-UTF-8 filenames. Those records carry a real hit we cannot represent.
+/// Since this capture IS the user's answer, dropping them silently loses
+/// search results — so the count is returned and the caller refuses to filter
+/// when it is non-zero.
+fn parse_rg_json(stdout: &str) -> (Vec<RgMatch>, usize) {
+    let mut matches = Vec::new();
+    let mut unparseable = 0usize;
+    for line in stdout.lines() {
+        let v: serde_json::Value = match serde_json::from_str(line.trim()) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("match") {
+            continue;
+        }
+        let parsed = (|| -> Option<RgMatch> {
             let d = v.get("data")?;
             Some(RgMatch {
                 file: d.get("path")?.get("text")?.as_str()?.to_string(),
@@ -1099,8 +1126,13 @@ fn parse_rg_json(stdout: &str) -> Vec<RgMatch> {
                     .trim_end_matches('\r')
                     .to_string(),
             })
-        })
-        .collect()
+        })();
+        match parsed {
+            Some(m) => matches.push(m),
+            None => unparseable += 1,
+        }
+    }
+    (matches, unparseable)
 }
 
 /// Above this many matches, stop filtering and render ripgrep's output as-is.
@@ -1116,6 +1148,9 @@ enum RgCapture {
     OverCap(Vec<RgMatch>),
     /// ripgrep could not be run, or failed. Caller should passthrough.
     Failed,
+    /// At least one `match` record could not be parsed, so the capture is not
+    /// ground truth and must not be used to filter.
+    Unparseable,
 }
 
 /// Short flags that select an OUTPUT MODE. These must never reach the internal
@@ -1199,7 +1234,10 @@ fn run_rg_capture(capture_argv: &[String]) -> RgCapture {
     if output.status.code().unwrap_or(2) > 1 {
         return RgCapture::Failed;
     }
-    let matches = parse_rg_json(&String::from_utf8_lossy(&output.stdout));
+    let (matches, unparseable) = parse_rg_json(&String::from_utf8_lossy(&output.stdout));
+    if unparseable > 0 {
+        return RgCapture::Unparseable;
+    }
     if matches.len() > MATCH_CAP {
         RgCapture::OverCap(matches)
     } else {
@@ -2473,6 +2511,22 @@ mod tests {
         assert_eq!(out.suppressed, 0);
     }
 
+    #[test]
+    fn a_language_that_confirms_nothing_is_treated_as_unsearched() {
+        // ast-grep against the wrong grammar exits 1 with no output AND no
+        // stderr, so "failed" and "found nothing" are indistinguishable. A real
+        // JS call inside a .html <script> block was being suppressed as noise.
+        let hits = vec![
+            rg_hit("app.py", 2, "    render_chart(data)"),
+            rg_hit("page.html", 2, "  render_chart(data);"),
+        ];
+        let ag = parse_ag_matches(&ag_json("app.py", 1, "    render_chart(data)"));
+        // Only python confirmed, so only python is in `searched`.
+        let out = filter_matches(&hits, &ag, &searched_set(&["app.py"]));
+        assert_eq!(out.kept.len(), 2, "the .html hit must survive: html confirmed nothing");
+        assert_eq!(out.suppressed, 0);
+    }
+
     // ── the comparison metric covers SEARCHED files only ──
 
     #[test]
@@ -2643,11 +2697,32 @@ mod tests {
 
     #[test]
     fn parses_a_match_record_with_one_based_line() {
-        let m = parse_rg_json(&rg_json_match("src/a.ts", 1, "const deviceId = 1;"));
+        let (m, _) = parse_rg_json(&rg_json_match("src/a.ts", 1, "const deviceId = 1;"));
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].file, "src/a.ts");
         assert_eq!(m[0].line, 1, "ripgrep line_number is already 1-based");
         assert_eq!(m[0].text, "const deviceId = 1;", "trailing newline stripped");
+    }
+
+    #[test]
+    fn parse_rg_json_reports_records_it_cannot_parse() {
+        // rg emits lines.bytes (base64) for a non-UTF-8 line. That record holds
+        // a real hit we cannot represent, so it must be COUNTED, not dropped.
+        let stream = format!(
+            "{}\n{}",
+            rg_json_match("a.py", 2, "render_chart(b)"),
+            r#"{"type":"match","data":{"path":{"text":"a.py"},"lines":{"bytes":"cmVuZGVy"},"line_number":1,"absolute_offset":0,"submatches":[]}}"#
+        );
+        let (matches, unparseable) = parse_rg_json(&stream);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(unparseable, 1, "the bytes-only record must be counted");
+    }
+
+    #[test]
+    fn parse_rg_json_reports_zero_unparseable_for_clean_input() {
+        let (matches, unparseable) = parse_rg_json(&rg_json_match("a.py", 1, "hit"));
+        assert_eq!(matches.len(), 1);
+        assert_eq!(unparseable, 0);
     }
 
     #[test]
@@ -2658,14 +2733,14 @@ mod tests {
             rg_json_match("src/a.ts", 3, "hit"),
             r#"{"type":"end","data":{"path":{"text":"src/a.ts"}}}"#
         );
-        let m = parse_rg_json(&stream);
+        let (m, _) = parse_rg_json(&stream);
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].line, 3);
     }
 
     #[test]
     fn empty_stream_yields_no_matches() {
-        assert!(parse_rg_json("").is_empty());
+        assert!(parse_rg_json("").0.is_empty());
     }
 
     #[test]
@@ -2675,7 +2750,7 @@ mod tests {
         let stream = format!(
             r#"{{"type":"match","data":{{"path":{{"text":"win.ts"}},"lines":{{"text":"const deviceId = 1;\r\n"}},"line_number":1,"absolute_offset":0,"submatches":[]}}}}"#
         );
-        let m = parse_rg_json(&stream);
+        let (m, _) = parse_rg_json(&stream);
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].text, "const deviceId = 1;", "no trailing \\r");
     }
