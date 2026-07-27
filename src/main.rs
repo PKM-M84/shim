@@ -1195,6 +1195,26 @@ fn is_output_mode_short(c: char) -> bool {
     matches!(c, 'c' | 'l' | 'n' | 'N')
 }
 
+/// Does this short-flag TOKEN select an output mode?
+///
+/// Scans characters left to right and STOPS at the first value-taking flag,
+/// because everything after it is that flag's value, not more flags. Without
+/// that stop, `-tcpp` (--type cpp), `-g*.c` (--glob) and `-eDeviceId` (the
+/// pattern) all contain a 'c' and would be dropped, silently discarding the
+/// caller's filter — or their search term. Mirrors the same boundary
+/// `parse_rg_invocation` uses, by calling the same predicate.
+fn short_token_is_output_mode(token: &str) -> bool {
+    for c in token.chars().skip(1) {
+        if is_output_mode_short(c) {
+            return true;
+        }
+        if short_takes_value(c) {
+            break; // the rest of this token is the flag's value
+        }
+    }
+    false
+}
+
 /// Build the argv for the internal ripgrep run: the caller's FILTER flags are
 /// kept (`-g`, `--type`, `-w`, the pattern, the paths) and OUTPUT-MODE flags are
 /// dropped, because we render the shape ourselves from the filtered set.
@@ -1214,13 +1234,12 @@ fn rg_capture_args(original: &[String]) -> Vec<String> {
         ) {
             continue;
         }
-        // Short-flag tokens may be BUNDLED (`-nc`, `-cl`). Test every character,
-        // not the whole token — exact-token matching missed these entirely.
-        // Bare `-` is ripgrep's stdin marker, not a flag.
-        if arg.len() >= 2 && arg.starts_with('-') && !arg.starts_with("--") {
-            if arg.chars().skip(1).any(is_output_mode_short) {
-                continue;
-            }
+        // Short-flag tokens may be BUNDLED (`-nc`, `-cl`). A bare `-` is
+        // ripgrep's stdin marker, not a flag, so require len >= 2.
+        if arg.len() >= 2 && arg.starts_with('-') && !arg.starts_with("--")
+            && short_token_is_output_mode(arg)
+        {
+            continue;
         }
         out.push(arg.clone());
     }
@@ -2834,5 +2853,35 @@ mod tests {
         // that parse_rg_json discards. Both are correct only via real rg.
         assert_eq!(parse(&["--vimgrep", "deviceId", "src"]).unsupported.as_deref(), Some("--vimgrep"));
         assert_eq!(parse(&["--passthru", "deviceId", "src"]).unsupported.as_deref(), Some("--passthru"));
+    }
+
+    #[test]
+    fn rg_capture_args_keep_a_bundled_type_value() {
+        // `-tcpp` is `--type cpp`. Scanning every character saw the 'c' in the
+        // VALUE and dropped the caller's type filter entirely.
+        let out = rg_capture_args(&strs(&["-tcpp", "deviceId", "src"]));
+        assert!(out.contains(&"-tcpp".to_string()), "-t's bundled value must survive");
+    }
+
+    #[test]
+    fn rg_capture_args_keep_a_bundled_glob_value() {
+        let out = rg_capture_args(&strs(&["-g*.c", "deviceId", "src"]));
+        assert!(out.contains(&"-g*.c".to_string()), "-g's bundled value must survive");
+    }
+
+    #[test]
+    fn rg_capture_args_keep_a_bundled_pattern_value() {
+        // `-eDeviceId` carries the SEARCH TERM. Dropping it made ripgrep treat
+        // the path as the pattern — a silent wrong answer.
+        let out = rg_capture_args(&strs(&["-eDeviceId", "src"]));
+        assert!(out.contains(&"-eDeviceId".to_string()), "-e's bundled pattern must survive");
+    }
+
+    #[test]
+    fn rg_capture_args_still_strip_output_mode_before_a_value_flag() {
+        // `-cg` is count bundled ahead of a glob: the 'c' comes first, so the
+        // token is still an output-mode token and must be stripped.
+        let out = rg_capture_args(&strs(&["-cg", "*.ts", "deviceId", "src"]));
+        assert!(!out.iter().any(|a| a == "-cg"), "leading -c must still strip");
     }
 }
