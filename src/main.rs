@@ -575,10 +575,14 @@ fn main() {
     // replaces the clap-derive struct that had to enumerate rg's whole flag surface.
     let inv = parse_rg_invocation(&args[1..]);
 
+    // `--no-smart` is ours; ripgrep would reject it. Every passthrough below
+    // forwards `rg_args`, never the raw argv.
+    let rg_args = strip_shim_flags(&args[1..], &inv.shim_flag_indices);
+
     let pattern = match inv.pattern.as_ref() {
         Some(p) => p.clone(),
         // No search term (e.g. `--files`, `--version`, `--type-list`): forward as-is.
-        None => exec_real_rg(&args[1..]),
+        None => exec_real_rg(&rg_args),
     };
 
     // Stream-filter guard: `cmd | rg PATTERN` reads stdin, which ast-grep cannot
@@ -589,7 +593,7 @@ fn main() {
     if inv.reads_stdin || is_stream_filter(inv.has_path, std::io::stdin().is_terminal()) {
         let reason = if inv.reads_stdin { "stdin_dash" } else { "stream_stdin" };
         log_event("passthrough", &pattern, reason, None, 0);
-        exec_real_rg(&args[1..]);
+        exec_real_rg(&rg_args);
     }
 
     // Flag-fidelity guard: a flag whose semantics ast-grep cannot reproduce
@@ -598,39 +602,104 @@ fn main() {
     // answer is right; the lost redirect is only a lost optimisation.
     if let Some(flag) = inv.unsupported.clone() {
         log_event("passthrough", &pattern, &format!("unsupported_flag_{flag}"), None, 0);
-        exec_real_rg(&args[1..]);
+        exec_real_rg(&rg_args);
     }
 
-    let lang_from_type = map_lang(&inv.file_type);
-    let is_structural = classify(&pattern);
-
-    // If no --type flag, try to infer language from the search path's file extensions.
-    let lang = lang_from_type.or_else(|| infer_lang_from_path(&inv.path));
-
-    if !is_structural || lang.is_none() {
-        let reason = if !is_structural { "not_structural" } else { "no_language" };
-        log_event("passthrough", &pattern, reason, lang, 0);
-        exec_real_rg(&args[1..]);
+    if inv.no_smart {
+        log_event("passthrough", &pattern, "no_smart", None, 0);
+        exec_real_rg(&rg_args);
     }
 
-    let lang = lang.unwrap();
+    if !classify(&pattern) {
+        log_event("passthrough", &pattern, "not_structural", None, 0);
+        exec_real_rg(&rg_args);
+    }
+
+    // ① ripgrep first: ground truth, and it can never be silently empty.
+    let rg_start = Instant::now();
+    let hits = match run_rg_capture(&inv.capture_argv) {
+        RgCapture::Failed => {
+            log_event("passthrough", &pattern, "rg_failed", None, 0);
+            exec_real_rg(&rg_args);
+        }
+        RgCapture::OverCap(hits) => {
+            // rg already ran — render what we have. Re-running it would
+            // reintroduce the double-execution this design removes.
+            log_event("fallback", &pattern, "over_cap", None, hits.len() as u64);
+            print!("{}", render_output(&hits, output_mode(&inv)));
+            std::process::exit(0);
+        }
+        RgCapture::Matches(hits) => hits,
+    };
+    let rg_time_ms = rg_start.elapsed().as_millis() as u64;
+
+    // ② Nothing to filter — ast-grep never spawns.
+    if hits.is_empty() {
+        log_event("no_match", &pattern, "rg_empty", None, 0);
+        std::process::exit(1);
+    }
+
+    // ③ ast-grep filters, once per language actually present in the hits.
+    let mut files: Vec<String> = hits.iter().map(|h| h.file.clone()).collect();
+    files.sort();
+    files.dedup(); // rg emits one record per matching LINE, not per file
+    let by_lang = group_files_by_lang(&files);
+
+    if by_lang.is_empty() {
+        // No hit file has a language ast-grep can parse. Nothing to filter.
+        log_event("fallback", &pattern, "no_searchable_language", None, hits.len() as u64);
+        print!("{}", render_output(&hits, output_mode(&inv)));
+        std::process::exit(0);
+    }
+
     let sg_pattern = translate_pattern(&pattern);
+    let searched: HashSet<String> = by_lang
+        .values()
+        .flatten()
+        .map(|f| norm_path(f.as_str()).to_string())
+        .collect();
 
-    eprintln!("\x1b[36m🔀 smart-rg → ast-grep ({})  pattern: '{}'\x1b[0m", lang, sg_pattern);
-
-    let match_count = run_ast_grep(&sg_pattern, lang, &inv.path, &inv);
-
-    // run_ast_grep already handled genuine errors (non-empty stderr -> exec real
-    // rg before returning), so here a clean run with 0 matches means ast-grep
-    // found nothing — commonly a wrong-language guess over a polyglot tree. Fall
-    // back to real rg so the user gets real hits instead of a silent empty.
-    // Logged as `fallback`, never a structural win, so the noise-avoided metric
-    // stays honest.
-    if match_count == 0 {
-        log_event("fallback", &pattern, "ast_grep_empty", Some(lang), 0);
-        exec_real_rg(&args[1..]);
+    let ag_start = Instant::now();
+    let mut ag: Vec<AgMatch> = Vec::new();
+    for (lang, lang_files) in &by_lang {
+        ag.extend(run_ast_grep_on_files(&sg_pattern, lang, lang_files));
     }
-    log_event("structural", &sg_pattern, "redirected", Some(lang), match_count);
+    let ag_time_ms = ag_start.elapsed().as_millis() as u64;
+    let lang_label = by_lang.keys().copied().collect::<Vec<&str>>().join(",");
+
+    let out = filter_matches(&hits, &ag, &searched);
+
+    // ④ ast-grep confirmed nothing in the files it searched — show every
+    // ripgrep hit rather than an empty answer, and do NOT credit a win.
+    if out.confirmed_hits == 0 {
+        log_event("fallback", &pattern, "ast_grep_empty", Some(&lang_label), hits.len() as u64);
+        print!("{}", render_output(&hits, output_mode(&inv)));
+        std::process::exit(0);
+    }
+
+    if out.suppressed > 0 {
+        eprintln!(
+            "\x1b[36msmart-rg: {} text-only match{} suppressed \
+             (comments/strings/SQL) — rerun with --no-smart\x1b[0m",
+            out.suppressed,
+            if out.suppressed == 1 { "" } else { "es" }
+        );
+    }
+    print!("{}", render_output(&out.kept, output_mode(&inv)));
+
+    let searched_files: HashSet<&str> = hits
+        .iter()
+        .map(|h| norm_path(h.file.as_str()))
+        .filter(|f| searched.contains(*f))
+        .collect();
+    log_event("structural", &sg_pattern, "filtered", Some(&lang_label), out.confirmed_hits as u64);
+    // Comparison covers SEARCHED files only: counting hits ast-grep never saw
+    // would manufacture fake "noise avoided".
+    log_comparison(
+        &pattern, &lang_label,
+        out.confirmed_hits as u64, by_lang.values().flatten().count() as u64, ag_time_ms,
+        out.searched_hits as u64, searched_files.len() as u64, rg_time_ms,
+    );
 }
 
 // ── Real rg executor ─────────────────────────────────────────
@@ -762,83 +831,6 @@ fn prune_old_events(conn: &Connection, days: u64) -> usize {
 }
 
 // ── Language mapping ─────────────────────────────────────────
-
-fn map_lang(file_type: &Option<String>) -> Option<&str> {
-    match file_type.as_deref() {
-        Some("ts") | Some("typescript") => Some("typescript"),
-        Some("tsx") => Some("tsx"),
-        Some("js") | Some("javascript") => Some("javascript"),
-        Some("jsx") => Some("jsx"),
-        Some("py") | Some("python") => Some("python"),
-        Some("rs") | Some("rust") => Some("rust"),
-        Some("go") | Some("golang") => Some("go"),
-        Some("rb") | Some("ruby") => Some("ruby"),
-        Some("java") => Some("java"),
-        Some("c") | Some("cpp") | Some("c++") => Some("c"),
-        Some("css") => Some("css"),
-        Some("html") => Some("html"),
-        Some("swift") => Some("swift"),
-        Some("kt") | Some("kotlin") => Some("kotlin"),
-        Some("scala") => Some("scala"),
-        Some("php") => Some("php"),
-        Some("sql") => Some("sql"),
-        Some("sh") | Some("bash") | Some("shell") => Some("bash"),
-        _ => None,
-    }
-}
-
-// Infer the dominant language by counting file extensions under a path.
-// Only called when no --type flag was passed; returns None if path isn't a dir
-// or has no recognizable source files. Capped at a shallow scan (max_depth=2)
-// so it never blocks on large trees.
-fn infer_lang_from_path(path: &str) -> Option<&'static str> {
-    use std::collections::HashMap;
-    let base = std::path::Path::new(path);
-    if !base.is_dir() {
-        // Single file — detect from extension directly.
-        return ext_to_lang(base.extension()?.to_str()?);
-    }
-
-    let mut counts: HashMap<&'static str, usize> = HashMap::new();
-    // Walk up to depth 2 to keep this cheap.
-    walk_for_lang(base, 0, &mut counts);
-
-    dominant_lang(&counts)
-}
-
-// Choose the dominant language from extension counts. Two rules beyond "most
-// frequent wins": (1) a real programming language always beats markup/style
-// (html/css) — a stray `report.html` next to `main.rs` must not flip a Rust dir
-// to HTML; (2) ties resolve alphabetically so the result is deterministic (a
-// HashMap's iteration order is not).
-fn dominant_lang(counts: &std::collections::HashMap<&'static str, usize>) -> Option<&'static str> {
-    const MARKUP: &[&str] = &["html", "css"];
-    // Within a group, pick the highest count; break ties by the alphabetically
-    // smaller name (then.cmp reversed) so the choice is deterministic.
-    let best = |markup_group: bool| -> Option<&'static str> {
-        counts.iter()
-            .filter(|(lang, _)| MARKUP.contains(lang) == markup_group)
-            .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
-            .map(|(lang, _)| *lang)
-    };
-    // Programming languages first; fall back to markup only if none present.
-    best(false).or_else(|| best(true))
-}
-
-fn walk_for_lang(dir: &std::path::Path, depth: u32, counts: &mut std::collections::HashMap<&'static str, usize>) {
-    if depth > 2 { return; }
-    let rd = match std::fs::read_dir(dir) { Ok(r) => r, Err(_) => return };
-    for entry in rd.flatten() {
-        let p = entry.path();
-        if p.is_dir() {
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.starts_with('.') || name == "node_modules" || name == "target" { continue; }
-            walk_for_lang(&p, depth + 1, counts);
-        } else if let Some(lang) = p.extension().and_then(|e| e.to_str()).and_then(ext_to_lang) {
-            *counts.entry(lang).or_insert(0) += 1;
-        }
-    }
-}
 
 fn ext_to_lang(ext: &str) -> Option<&'static str> {
     match ext {
@@ -1023,118 +1015,6 @@ fn translate_pattern(pattern: &str) -> String {
     pattern.to_string()
 }
 
-// ── run_rg_count (for comparison baseline using --count) ────
-/// Runs real rg --count on the ORIGINAL user CLI args (replay) to get
-/// accurate (total_matches, file_count) for ROI savings vs AST results.
-fn run_rg_count(original_args: &[String], search_path: &str) -> (u64, u64) {
-    // Resolve the real ripgrep safely (never the shim — see real_rg_path).
-    // If we can't find it, skip the baseline rather than risk a re-exec loop.
-    let rg = match real_rg_path() {
-        Some(p) => p,
-        None => return (0, 0),
-    };
-
-    let mut cmd = Command::new(&rg);
-    // --count-matches, NOT --count: ast-grep's figure is a count of matched AST
-    // NODES (occurrences), while `--count` reports the number of matching LINES.
-    // Comparing the two measured different things — two occurrences on one line
-    // scored rg=1 against ag=2, producing "impossible" rows where the text tool
-    // appears to find LESS than the structural one and systematically
-    // understating the noise ast-grep avoided.
-    //
-    // -F (literal): the intercepted pattern is often a structural form like `foo(`
-    // that is an INVALID regex for ripgrep. Without -F the baseline silently errors
-    // to 0 results and the reported savings collapse for exactly the paren-style
-    // patterns the shim is built to redirect.
-    cmd.arg("--count-matches").arg("-F");
-    let mut i = 0;
-    let args_slice = original_args;
-    while i < args_slice.len() {
-        let arg = &args_slice[i];
-        // Skip output-mode flags that conflict with --count
-        if matches!(arg.as_str(), "-c" | "--count" | "--count-matches" | "-l" | "--files-with-matches"
-            | "--files" | "--files-without-match" | "-o" | "--only-matching") {
-            i += 1;
-            continue;
-        }
-        // Translate --type to -g globs for EVERY language map_lang accepts. We
-        // glob uniformly rather than pass some type names through, because rg's
-        // type vocabulary doesn't match ast-grep's: rg has no `tsx`/`jsx` type and
-        // names Rust/Ruby `rust`/`ruby`, so `--type rs` etc. would error and zero
-        // the baseline. Globs always work; unknown types fall through unchanged.
-        if arg == "--type" || arg == "-t" {
-            if i + 1 < args_slice.len() {
-                let globs: &[&str] = match args_slice[i + 1].as_str() {
-                    "ts" | "typescript" => &["*.ts"],
-                    "tsx" => &["*.tsx"],
-                    "js" | "javascript" => &["*.js"],
-                    "jsx" => &["*.jsx"],
-                    "py" | "python" => &["*.py"],
-                    "rs" | "rust" => &["*.rs"],
-                    "rb" | "ruby" => &["*.rb"],
-                    "go" | "golang" => &["*.go"],
-                    "java" => &["*.java"],
-                    "c" => &["*.c", "*.h"],
-                    "cpp" | "c++" => &["*.cpp", "*.cc", "*.cxx", "*.hpp", "*.hh"],
-                    "css" => &["*.css"],
-                    "html" => &["*.html"],
-                    "swift" => &["*.swift"],
-                    "kt" | "kotlin" => &["*.kt"],
-                    "scala" => &["*.scala"],
-                    "php" => &["*.php"],
-                    "sql" => &["*.sql"],
-                    "sh" | "bash" | "shell" => &["*.sh"],
-                    _ => &[],
-                };
-                if !globs.is_empty() {
-                    for g in globs {
-                        cmd.arg("-g").arg(g);
-                    }
-                    i += 2;
-                    continue;
-                }
-            }
-        }
-        cmd.arg(arg);
-        i += 1;
-    }
-    // Append the search path only if the replayed args don't already carry it.
-    // ripgrep does NOT dedupe path arguments, so passing it twice double-counts
-    // every file and inflates the reported savings. When the user passed no path,
-    // search_path is "." (clap's default) and is absent from the args, so we add it.
-    if !args_slice.iter().any(|a| a == search_path) {
-        cmd.arg(search_path);
-    }
-
-    let output = match cmd.stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-    {
-        Ok(o) => o,
-        Err(_) => return (0, 0),
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut total_matches = 0u64;
-    let mut file_count = 0u64;
-    for line in stdout.lines() {
-        let t = line.trim();
-        if t.is_empty() { continue; }
-        if let Some(colon) = t.rfind(':') {
-            let (p, cpart) = t.split_at(colon);
-            if !p.is_empty() {
-                if let Ok(cnt) = cpart[1..].trim().parse::<u64>() {
-                    if cnt > 0 {
-                        total_matches += cnt;
-                        file_count += 1;
-                    }
-                }
-            }
-        }
-    }
-    (total_matches, file_count)
-}
-
 // ── log_comparison (inserts into comparisons with ROI fields + rate limit) ─
 fn log_comparison(
     pattern: &str,
@@ -1297,6 +1177,12 @@ fn capture_command_args(capture_argv: &[String]) -> Vec<String> {
 /// matches", which is a normal empty result, not a failure — only a spawn
 /// failure or an exit code above 1 is treated as `Failed`.
 fn run_rg_capture(capture_argv: &[String]) -> RgCapture {
+    // PRECONDITION: only valid once main() has established that this call has a
+    // pattern and carries no unsupported flag. ripgrep's own top-level modes
+    // (--files, --type-list, -h, --generate) print plain text and exit 0, which
+    // would parse to a silent false empty. main()'s pattern-None and --help
+    // early returns are what exclude them; they must stay ahead of this call.
+    debug_assert!(!capture_argv.is_empty(), "capture argv must carry a pattern");
     let rg = match real_rg_path() {
         Some(p) => p,
         None => return RgCapture::Failed,
@@ -1416,10 +1302,90 @@ fn is_confirmed(hit: &RgMatch, spans: &HashMap<&str, Vec<(u64, u64)>>) -> bool {
         .is_some_and(|v| v.iter().any(|&(start, end)| hit.line >= start && hit.line <= end))
 }
 
+/// What survived filtering, plus the counts the telemetry needs.
+struct FilterOutcome {
+    /// Hits to print.
+    kept: Vec<RgMatch>,
+    /// Searched-but-unconfirmed hits (comments, strings, SQL) that were hidden.
+    suppressed: usize,
+    /// Hits in files ast-grep actually searched — the honest comparison denominator.
+    searched_hits: usize,
+    /// Of those, how many ast-grep confirmed.
+    confirmed_hits: usize,
+}
+
+/// Split ripgrep's hits into what to print and what was hidden.
+///
+/// A hit is kept when ast-grep confirmed it, OR when its file was never searched
+/// at all. `group_files_by_lang` drops any extension it cannot map (`.sql`,
+/// `.md`, `.json`, and case-mismatched `.TS`), so those files reach ast-grep
+/// never and can produce no confirmations. Suppressing them would silently
+/// delete real results — `rg tenant_id src/` would print the `db.py` hits and
+/// swallow every `schema.sql` one.
+///
+/// `searched` holds NORMALISED paths (`norm_path`), because ripgrep reports
+/// `./db.py` where ast-grep reports `db.py`.
+fn filter_matches(hits: &[RgMatch], ag: &[AgMatch], searched: &HashSet<String>) -> FilterOutcome {
+    let spans = confirmed_spans(ag);
+    let mut kept = Vec::new();
+    let mut suppressed = 0usize;
+    let mut searched_hits = 0usize;
+    let mut confirmed_hits = 0usize;
+    for h in hits {
+        let was_searched = searched.contains(norm_path(h.file.as_str()));
+        if !was_searched {
+            kept.push(h.clone());
+            continue;
+        }
+        searched_hits += 1;
+        if is_confirmed(h, &spans) {
+            confirmed_hits += 1;
+            kept.push(h.clone());
+        } else {
+            suppressed += 1;
+        }
+    }
+    FilterOutcome { kept, suppressed, searched_hits, confirmed_hits }
+}
+
+/// Run ast-grep over an EXPLICIT file list rather than a directory.
+///
+/// Two wins over walking a directory: ast-grep and ripgrep can no longer
+/// disagree about ignore rules, and the language is known to be right because it
+/// came from these files' own extensions. Errors yield no matches; the caller
+/// then shows ripgrep's hits, so a failure is never silent.
+fn run_ast_grep_on_files(sg_pattern: &str, lang: &str, files: &[String]) -> Vec<AgMatch> {
+    let mut cmd = Command::new("ast-grep");
+    cmd.arg("run").arg("-p").arg(sg_pattern).arg("-l").arg(lang);
+    for f in files {
+        cmd.arg(f);
+    }
+    cmd.arg("--json=stream");
+    match cmd.output() {
+        Ok(o) => parse_ag_matches(&String::from_utf8_lossy(&o.stdout)),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The output shape the caller asked for.
+fn output_mode(inv: &RgInvocation) -> OutputMode {
+    if inv.count {
+        // rg omits the path prefix only when exactly one FILE was named.
+        let single_file = inv.paths.len() == 1 && std::path::Path::new(&inv.paths[0]).is_file();
+        OutputMode::Count { show_filename: !single_file }
+    } else if inv.files_with_matches {
+        OutputMode::FilesWithMatches
+    } else {
+        OutputMode::Content {
+            line_numbers: inv.line_numbers.unwrap_or_else(|| std::io::stdout().is_terminal()),
+        }
+    }
+}
+
 /// Render matches in ripgrep's output shape for the requested mode. Files are
 /// emitted in sorted order: ast-grep's parallel walk is nondeterministic, and a
 /// stable order is what makes the output diffable.
-fn render_output(matches: &[AgMatch], mode: OutputMode) -> String {
+fn render_output(matches: &[RgMatch], mode: OutputMode) -> String {
     let mut out = String::new();
     match mode {
         OutputMode::Content { line_numbers } => {
@@ -1453,97 +1419,6 @@ fn render_output(matches: &[AgMatch], mode: OutputMode) -> String {
         }
     }
     out
-}
-
-// ── ast-grep runner ──────────────────────────────────────────
-
-fn run_ast_grep(sg_pattern: &str, lang: &str, path: &str, inv: &RgInvocation) -> u64 {
-    let ag_start = std::time::Instant::now();
-    let mut cmd = Command::new("ast-grep");
-    cmd.arg("run")
-        .arg("-p").arg(sg_pattern)
-        .arg("-l").arg(lang);
-    // Forward the caller's file filters — ast-grep's --globs takes the same
-    // gitignore-style syntax as rg's -g, `!` negation included.
-    for g in &inv.globs {
-        cmd.arg("--globs").arg(g);
-    }
-    // Search EVERY path the caller gave, not just the first.
-    if inv.paths.is_empty() {
-        cmd.arg(path);
-    } else {
-        for p in &inv.paths {
-            cmd.arg(p);
-        }
-    }
-    cmd.arg("--json=stream");
-
-    let output = match cmd.output() {
-        Ok(o) => o,
-        Err(_) => {
-            log_event("ast_grep_error", sg_pattern, "spawn_failed", Some(lang), 0);
-            let args: Vec<String> = std::env::args().skip(1).collect();
-            exec_real_rg(&args);
-        }
-    };
-    let ag_time_ms = ag_start.elapsed().as_millis() as u64;
-
-    if !output.status.success() {
-        // ast-grep exits 1 on "no matches" — that is the normal empty-result case,
-        // not a failure, and it writes nothing to stderr. A genuine failure (bad
-        // path, unreadable file/stream, internal error) writes to stderr. Only the
-        // latter is a real error: log it AND fall back to real rg so the user still
-        // gets results instead of a silent empty answer.
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.trim().is_empty() {
-            log_event("ast_grep_error", sg_pattern,
-                &format!("exit_{}_stderr_{}", output.status, stderr.trim()), Some(lang), 0);
-            let args: Vec<String> = std::env::args().skip(1).collect();
-            exec_real_rg(&args);
-        }
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let matches = parse_ag_matches(&stdout);
-
-    let count = matches.len() as u64;
-    let ag_unique_files: HashSet<&str> = matches.iter().map(|m| m.file.as_str()).collect();
-    let ag_file_count = ag_unique_files.len() as u64;
-
-    let mode = if inv.count {
-        // rg omits the path prefix only when exactly one FILE was named.
-        let single_file = inv.paths.len() == 1 && std::path::Path::new(&inv.paths[0]).is_file();
-        OutputMode::Count { show_filename: !single_file }
-    } else if inv.files_with_matches {
-        OutputMode::FilesWithMatches
-    } else {
-        // Unset → ripgrep's own default: line numbers for a TTY, none when piped.
-        OutputMode::Content {
-            line_numbers: inv.line_numbers.unwrap_or_else(|| std::io::stdout().is_terminal()),
-        }
-    };
-    print!("{}", render_output(&matches, mode));
-
-    // Capture comparison data (rg vs ast-grep) for the report. Record the RAW
-    // user pattern (what rg was counted against), not the translated ast-grep
-    // form, so the report's Pattern column matches the numbers beside it.
-    //
-    // Only credit savings when ast-grep actually won (count > 0). On a 0-match
-    // redirect main now falls back to real rg and SHOWS those results, so
-    // crediting "noise avoided" for them would be false. (Supersedes the earlier
-    // v0.3.6 "log every redirect incl. count==0" choice — see issue #12.)
-    if count > 0 {
-        let raw_pattern = inv.pattern.as_deref().unwrap_or(sg_pattern);
-        let rg_start = Instant::now();
-        let (rg_results, rg_file_count) = run_rg_count(&std::env::args().skip(1).collect::<Vec<_>>(), path);
-        let rg_time_ms = rg_start.elapsed().as_millis() as u64;
-        log_comparison(raw_pattern, lang, count, ag_file_count, ag_time_ms, rg_results, rg_file_count, rg_time_ms);
-    }
-
-    if matches.is_empty() {
-        return 0;
-    }
-    count
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -2362,37 +2237,6 @@ mod tests {
         assert_eq!(translate_pattern("func("), "func($$$)");
     }
 
-    // ── dominant_lang: programming beats markup, ties deterministic ──
-
-    fn counts(pairs: &[(&'static str, usize)]) -> std::collections::HashMap<&'static str, usize> {
-        pairs.iter().cloned().collect()
-    }
-
-    #[test]
-    fn programming_language_beats_markup() {
-        assert_eq!(dominant_lang(&counts(&[("rust", 1), ("html", 1)])), Some("rust"));
-    }
-
-    #[test]
-    fn markup_used_only_when_no_programming_language_present() {
-        assert_eq!(dominant_lang(&counts(&[("html", 2), ("css", 1)])), Some("html"));
-    }
-
-    #[test]
-    fn highest_count_wins_among_programming_languages() {
-        assert_eq!(dominant_lang(&counts(&[("rust", 3), ("python", 1)])), Some("rust"));
-    }
-
-    #[test]
-    fn ties_break_alphabetically_for_determinism() {
-        assert_eq!(dominant_lang(&counts(&[("go", 2), ("rust", 2)])), Some("go"));
-    }
-
-    #[test]
-    fn empty_counts_is_none() {
-        assert_eq!(dominant_lang(&counts(&[])), None);
-    }
-
     // ── flag fidelity: what ast-grep cannot express must pass through ──
     //
     // run_ast_grep honoured only -c/-l and silently dropped everything else, so a
@@ -2563,9 +2407,94 @@ mod tests {
         assert_eq!(m[0].file, "src/a.ts");
     }
 
+    // ── filter_matches: rg is ground truth, ast-grep filters it ──
+
+    fn rg_hit(file: &str, line: u64, text: &str) -> RgMatch {
+        RgMatch { file: file.into(), line, text: text.into() }
+    }
+
+    fn searched_set(files: &[&str]) -> HashSet<String> {
+        files.iter().map(|f| norm_path(f).to_string()).collect()
+    }
+
+    // ── never filter a file ast-grep did not search ──
+    //
+    // group_files_by_lang drops any extension it cannot map (.sql, .md, .json,
+    // and case-mismatched .TS). Those files never reach ast-grep, so they can
+    // produce no confirmations. Suppressing them would silently delete real
+    // results — the failure class behind v0.3.9, v0.3.10 and v0.3.12.
+
+    #[test]
+    fn hits_in_an_unsearched_file_are_never_suppressed() {
+        let hits = vec![
+            rg_hit("db.py", 1, "bypass_rls(conn)"),
+            rg_hit("db.py", 7, "# bypass_rls in a comment"),
+            rg_hit("schema.sql", 3, "-- bypass_rls policy"),
+        ];
+        let ag = parse_ag_matches(&ag_json("db.py", 0, "bypass_rls(conn)"));
+        let searched = searched_set(&["db.py"]); // schema.sql has no ast-grep language
+        let out = filter_matches(&hits, &ag, &searched);
+        assert_eq!(
+            out.kept,
+            vec![rg_hit("db.py", 1, "bypass_rls(conn)"), rg_hit("schema.sql", 3, "-- bypass_rls policy")],
+            "the SQL hit must survive: ast-grep never looked at that file"
+        );
+        assert_eq!(out.suppressed, 1, "only the searched-but-unconfirmed comment");
+    }
+
+    #[test]
+    fn filter_keeps_confirmed_hits_and_counts_the_rest() {
+        let hits = vec![
+            rg_hit("a.py", 1, "bypass_rls(conn)"),
+            rg_hit("a.py", 7, "# bypass_rls is used above"),
+            rg_hit("a.py", 9, "SQL = 'select bypass_rls'"),
+        ];
+        let ag = parse_ag_matches(&ag_json("a.py", 0, "bypass_rls(conn)"));
+        let out = filter_matches(&hits, &ag, &searched_set(&["a.py"]));
+        assert_eq!(out.kept, vec![rg_hit("a.py", 1, "bypass_rls(conn)")]);
+        assert_eq!(out.suppressed, 2, "the comment and the SQL string");
+    }
+
+    #[test]
+    fn filter_with_no_confirmations_keeps_nothing_from_searched_files() {
+        let hits = vec![rg_hit("a.py", 1, "tenant_id = 1")];
+        let out = filter_matches(&hits, &[], &searched_set(&["a.py"]));
+        assert!(out.kept.is_empty());
+        assert_eq!(out.suppressed, 1);
+    }
+
+    #[test]
+    fn a_dot_slash_hit_matches_a_normalised_searched_path() {
+        // rg reports "./db.py"; the searched set is built with norm_path.
+        let hits = vec![rg_hit("./db.py", 1, "bypass_rls(conn)")];
+        let ag = parse_ag_matches(&ag_json("db.py", 0, "bypass_rls(conn)"));
+        let out = filter_matches(&hits, &ag, &searched_set(&["db.py"]));
+        assert_eq!(out.kept.len(), 1, "leading ./ must not defeat the searched lookup");
+        assert_eq!(out.suppressed, 0);
+    }
+
+    // ── the comparison metric covers SEARCHED files only ──
+
+    #[test]
+    fn comparison_counts_exclude_unsearched_files() {
+        // Counting unsearched hits as rg_results while ast-grep never saw them
+        // would manufacture fake "noise avoided".
+        let hits = vec![
+            rg_hit("a.py", 1, "bypass_rls(conn)"),
+            rg_hit("a.py", 7, "# bypass_rls"),
+            rg_hit("notes.md", 2, "bypass_rls docs"),
+        ];
+        let ag = parse_ag_matches(&ag_json("a.py", 0, "bypass_rls(conn)"));
+        let out = filter_matches(&hits, &ag, &searched_set(&["a.py"]));
+        assert_eq!(out.searched_hits, 2, "only the two a.py hits");
+        assert_eq!(out.confirmed_hits, 1);
+    }
+
+    // ── render_output now renders ripgrep hits ──
+
     #[test]
     fn content_output_is_file_colon_line_colon_text() {
-        let m = parse_ag_matches(&ag_json("src/a.ts", 0, "const deviceId = 1;"));
+        let m = vec![rg_hit("src/a.ts", 1, "const deviceId = 1;")];
         assert_eq!(
             render_output(&m, OutputMode::Content { line_numbers: true }),
             "src/a.ts:1:const deviceId = 1;\n"
@@ -2574,8 +2503,7 @@ mod tests {
 
     #[test]
     fn content_output_omits_the_line_number_when_not_asked_for() {
-        // Piped `rg PATTERN src` prints `file:content` — no line field.
-        let m = parse_ag_matches(&ag_json("src/a.ts", 0, "const deviceId = 1;"));
+        let m = vec![rg_hit("src/a.ts", 1, "const deviceId = 1;")];
         assert_eq!(
             render_output(&m, OutputMode::Content { line_numbers: false }),
             "src/a.ts:const deviceId = 1;\n"
@@ -2685,13 +2613,7 @@ mod tests {
 
     #[test]
     fn count_output_is_per_file_like_ripgrep() {
-        let stdout = format!(
-            "{}\n{}\n{}",
-            ag_json("src/a.ts", 0, "a"),
-            ag_json("src/a.ts", 4, "b"),
-            ag_json("src/b.ts", 2, "c")
-        );
-        let m = parse_ag_matches(&stdout);
+        let m = vec![rg_hit("src/a.ts", 1, "a"), rg_hit("src/a.ts", 5, "b"), rg_hit("src/b.ts", 3, "c")];
         assert_eq!(
             render_output(&m, OutputMode::Count { show_filename: true }),
             "src/a.ts:2\nsrc/b.ts:1\n"
@@ -2701,19 +2623,13 @@ mod tests {
     #[test]
     fn count_output_omits_the_filename_for_a_single_explicit_file() {
         // `rg -c PATTERN src/a.ts` prints a bare count, no path prefix.
-        let m = parse_ag_matches(&format!("{}\n{}", ag_json("src/a.ts", 0, "a"), ag_json("src/a.ts", 4, "b")));
+        let m = vec![rg_hit("src/a.ts", 1, "a"), rg_hit("src/a.ts", 5, "b")];
         assert_eq!(render_output(&m, OutputMode::Count { show_filename: false }), "2\n");
     }
 
     #[test]
     fn files_with_matches_output_is_sorted_and_deduped() {
-        let stdout = format!(
-            "{}\n{}\n{}",
-            ag_json("src/b.ts", 0, "a"),
-            ag_json("src/a.ts", 0, "b"),
-            ag_json("src/b.ts", 3, "c")
-        );
-        let m = parse_ag_matches(&stdout);
+        let m = vec![rg_hit("src/b.ts", 1, "a"), rg_hit("src/a.ts", 1, "b"), rg_hit("src/b.ts", 4, "c")];
         assert_eq!(render_output(&m, OutputMode::FilesWithMatches), "src/a.ts\nsrc/b.ts\n");
     }
 
