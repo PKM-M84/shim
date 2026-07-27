@@ -1183,11 +1183,25 @@ fn parse_ag_matches(stdout: &str) -> Vec<AgMatch> {
         .collect()
 }
 
+/// Normalise a path string for cross-tool comparison.
+///
+/// ripgrep echoes the caller's path verbatim (`./src/a.ts`) while ast-grep
+/// strips a leading `./` (`src/a.ts`). Keying the span map on raw strings
+/// therefore misses on EVERY file whenever the caller passes a `./`-prefixed
+/// path — Claude Code's canonical call shape — silently disabling filtering.
+fn norm_path(p: &str) -> &str {
+    let mut s = p;
+    while let Some(rest) = s.strip_prefix("./") {
+        s = rest;
+    }
+    s
+}
+
 /// Line spans (1-based, inclusive) ast-grep confirmed, keyed by file.
 fn confirmed_spans(matches: &[AgMatch]) -> HashMap<&str, Vec<(u64, u64)>> {
     let mut spans: HashMap<&str, Vec<(u64, u64)>> = HashMap::new();
     for m in matches {
-        spans.entry(m.file.as_str()).or_default().push((m.line, m.end_line));
+        spans.entry(norm_path(m.file.as_str())).or_default().push((m.line, m.end_line));
     }
     spans
 }
@@ -1199,7 +1213,7 @@ fn confirmed_spans(matches: &[AgMatch]) -> HashMap<&str, Vec<(u64, u64)>> {
 /// silently drops hits on continuation lines of a multi-line call.
 fn is_confirmed(hit: &RgMatch, spans: &HashMap<&str, Vec<(u64, u64)>>) -> bool {
     spans
-        .get(hit.file.as_str())
+        .get(norm_path(hit.file.as_str()))
         .is_some_and(|v| v.iter().any(|&(start, end)| hit.line >= start && hit.line <= end))
 }
 
@@ -2283,6 +2297,28 @@ mod tests {
     //
     // Confirming on the start line alone silently drops the second hit — the
     // same silent-drop shape as v0.3.9, v0.3.10 and v0.3.12.
+
+    #[test]
+    fn a_dot_slash_rg_path_matches_ast_greps_normalised_path() {
+        // rg reports "./src/a.ts"; ast-grep reports "src/a.ts" for the same file.
+        // Raw-string keying missed on every file for the `./src` call shape.
+        let ag = parse_ag_matches(&ag_json("src/a.ts", 0, "const deviceId = 1;"));
+        let spans = confirmed_spans(&ag);
+        let hit = RgMatch {
+            file: "./src/a.ts".into(),
+            line: 1,
+            text: "const deviceId = 1;".into(),
+        };
+        assert!(is_confirmed(&hit, &spans), "leading ./ must not defeat the lookup");
+    }
+
+    #[test]
+    fn norm_path_strips_repeated_leading_dot_slash() {
+        assert_eq!(norm_path("./src/a.ts"), "src/a.ts");
+        assert_eq!(norm_path("././src/a.ts"), "src/a.ts");
+        assert_eq!(norm_path("src/a.ts"), "src/a.ts");
+        assert_eq!(norm_path("/abs/src/a.ts"), "/abs/src/a.ts");
+    }
 
     #[test]
     fn ast_grep_end_line_is_normalised_to_one_based() {
