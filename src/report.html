@@ -135,6 +135,7 @@
     <div class="meta">
       <div>smart-rg v__SHIM_VERSION__</div>
       <div>Generated: <span id="genTime"></span></div>
+      <div id="dataWindow"></div>
     </div>
   </header>
 
@@ -156,6 +157,11 @@ function escHtml(s) {
 
 function render(stats) {
   document.getElementById('genTime').textContent = new Date().toLocaleString();
+  // State the window every figure on this page describes. Events and
+  // comparisons now share one retention policy, so a single date is honest.
+  if (stats.data_since) {
+    document.getElementById('dataWindow').textContent = `All data since ${stats.data_since}`;
+  }
 
   if (!stats || stats.total_intercepted === 0) {
     document.getElementById('content').innerHTML = `
@@ -174,7 +180,11 @@ function render(stats) {
     : '0.0';
 
   const hasComparisons = Array.isArray(stats.comparisons) && stats.comparisons.length > 0;
-  const compCount = hasComparisons ? stats.comparisons.length : 0;
+  // The REAL row count, not stats.comparisons.length — that array is only the
+  // page rendered in the detail table below, so reading its length pinned this
+  // KPI to the page size (an unchanging "50") for any database past it.
+  const compCount = stats.comparison_runs || 0;
+  const compShown = hasComparisons ? stats.comparisons.length : 0;
 
   // === PRECISION-FIRST KPIs ===
   // Primary metric is "noise avoided" — false-positive matches a naive text
@@ -355,7 +365,13 @@ function render(stats) {
 
     <!-- PRIMARY VIEW: Detail Comparison Table -->
     <div class="card primary-comparison">
-      <h3>rg vs ast-grep — File & Token Savings (Primary)</h3>
+      <h3>rg vs ast-grep — File &amp; Token Savings (Primary)</h3>
+      ${compShown < compCount
+        ? `<div style="color:var(--muted);font-size:0.76rem;margin:-0.2rem 0 0.6rem">
+             Showing the ${compShown.toLocaleString()} most recent of ${compCount.toLocaleString()} comparison runs.
+             The KPIs above cover all ${compCount.toLocaleString()}.
+           </div>`
+        : ''}
       ${comparisonTableHTML}
     </div>
 

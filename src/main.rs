@@ -891,17 +891,24 @@ fn run_rg_count(original_args: &[String], search_path: &str) -> (u64, u64) {
     };
 
     let mut cmd = Command::new(&rg);
+    // --count-matches, NOT --count: ast-grep's figure is a count of matched AST
+    // NODES (occurrences), while `--count` reports the number of matching LINES.
+    // Comparing the two measured different things — two occurrences on one line
+    // scored rg=1 against ag=2, producing "impossible" rows where the text tool
+    // appears to find LESS than the structural one and systematically
+    // understating the noise ast-grep avoided.
+    //
     // -F (literal): the intercepted pattern is often a structural form like `foo(`
     // that is an INVALID regex for ripgrep. Without -F the baseline silently errors
     // to 0 results and the reported savings collapse for exactly the paren-style
     // patterns the shim is built to redirect.
-    cmd.arg("--count").arg("-F");
+    cmd.arg("--count-matches").arg("-F");
     let mut i = 0;
     let args_slice = original_args;
     while i < args_slice.len() {
         let arg = &args_slice[i];
         // Skip output-mode flags that conflict with --count
-        if matches!(arg.as_str(), "-c" | "--count" | "-l" | "--files-with-matches"
+        if matches!(arg.as_str(), "-c" | "--count" | "--count-matches" | "-l" | "--files-with-matches"
             | "--files" | "--files-without-match" | "-o" | "--only-matching") {
             i += 1;
             continue;
@@ -1232,6 +1239,11 @@ struct StatsReport {
     // match correctly skipped — summed as max(0, rg_results − ag_matches).
     total_false_positives_avoided: u64,
     total_files_saved: u64,
+    /// Real row count of the comparisons table. NOT `comparisons.len()`, which
+    /// is only the page rendered in the detail table.
+    comparison_runs: u64,
+    /// Oldest record still held (YYYY-MM-DD) — the window the page describes.
+    data_since: String,
     total_tokens_saved_estimate: u64,
     total_cost_saved_cents: f64,
     by_event: HashMap<String, u64>,
@@ -1300,20 +1312,87 @@ fn open_db() -> Option<Connection> {
     Some(conn)
 }
 
+/// Whole-table savings totals.
+///
+/// Deliberately a SEPARATE query from the one that feeds the detail table. That
+/// query is paginated (`ORDER BY id DESC LIMIT N`) and the totals used to be
+/// summed inside its row loop, so every headline KPI silently described only
+/// the newest page — "Comparison Runs" read exactly the page size for any
+/// database past it, and a live 402-row DB reported 104 files saved of 4,748.
+struct ComparisonTotals {
+    runs: u64,
+    files_saved: u64,
+    false_positives: u64,
+    tokens_saved: u64,
+    cost_saved_cents: f64,
+}
+
+fn comparison_totals(conn: &Connection) -> ComparisonTotals {
+    // Mirrors the report front-end's precedence (estimated_* when present, else
+    // text − ast) and its never-negative floor — but over EVERY row, so the
+    // headline totals and the detail table can no longer tell different stories.
+    conn.query_row(
+        "SELECT
+            COUNT(*),
+            COALESCE(SUM(files_saved), 0),
+            COALESCE(SUM(MAX(rg_results - ag_matches, 0)), 0),
+            COALESCE(SUM(CASE WHEN estimated_tokens_saved > 0
+                              THEN estimated_tokens_saved
+                              ELSE MAX(text_tokens - ast_tokens, 0) END), 0),
+            COALESCE(SUM(CASE WHEN estimated_cost_saved_cents != 0.0
+                              THEN MAX(estimated_cost_saved_cents, 0.0)
+                              ELSE MAX(text_cost_cents - ast_cost_cents, 0.0) END), 0.0)
+         FROM comparisons",
+        [],
+        |r| {
+            Ok(ComparisonTotals {
+                runs: r.get(0)?,
+                files_saved: r.get(1)?,
+                false_positives: r.get(2)?,
+                tokens_saved: r.get(3)?,
+                cost_saved_cents: r.get(4)?,
+            })
+        },
+    )
+    .unwrap_or(ComparisonTotals {
+        runs: 0,
+        files_saved: 0,
+        false_positives: 0,
+        tokens_saved: 0,
+        cost_saved_cents: 0.0,
+    })
+}
+
+/// How many comparison rows the detail table shows. The totals above cover the
+/// whole table regardless; this only bounds the rendered rows.
+const COMPARISON_PAGE: usize = 50;
+
 fn compute_stats() -> StatsReport {
     let conn = match open_db() {
         Some(c) => c,
         None => return empty_stats(),
     };
 
-    // Lazy retention: prune old events when the (infrequent, human-run) stats/report
-    // is generated, instead of on every search.
-    let _ = prune_old_events(&conn, 30);
+    // NOTE: generating a report no longer prunes. The old lazy `prune_old_events`
+    // here silently deleted events older than 30 days every time the report was
+    // viewed, while `comparisons` was never pruned — so one page mixed a 30-day
+    // event window with an all-time comparison table. Retention stays available
+    // as the explicit `smart-rg prune` command.
 
     let total: u64 = conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0)).unwrap_or(0);
     if total == 0 {
         return empty_stats();
     }
+
+    // The single window the whole page describes: the oldest record we still hold.
+    let data_since: String = conn
+        .query_row(
+            "SELECT date(MIN(CAST(substr(ts, 1, instr(ts, '.') - 1) AS INTEGER)), 'unixepoch')
+             FROM (SELECT ts FROM events UNION ALL SELECT ts FROM comparisons)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_default();
 
     let structural: u64 = conn.query_row(
         "SELECT COUNT(*) FROM events WHERE event='structural'", [], |r| r.get(0)
@@ -1448,18 +1527,18 @@ fn compute_stats() -> StatsReport {
         }
     }
 
-    // Comparison data (rg vs ag savings)
+    // Headline savings: computed over the WHOLE table, independent of the page
+    // of rows the detail table renders below.
+    let totals = comparison_totals(&conn);
+
+    // Comparison rows for the detail table (most recent page).
     let mut comparisons = Vec::new();
-    let mut total_files_saved = 0u64;
-    let mut total_false_positives = 0u64;
-    let mut total_tokens_saved = 0u64;
-    let mut total_cost_saved = 0.0f64;
     let stmt = conn.prepare(
         "SELECT pattern, lang, ag_matches, ag_files, ag_time_ms, rg_results, rg_files, rg_time_ms, files_saved, estimated_tokens_saved, estimated_cost_saved_cents, text_tokens, ast_tokens, text_cost_cents, ast_cost_cents
-         FROM comparisons ORDER BY id DESC LIMIT 50"
+         FROM comparisons ORDER BY id DESC LIMIT ?1"
     ).ok();
     if let Some(mut s) = stmt {
-        let rows = s.query_map([], |row| {
+        let rows = s.query_map([COMPARISON_PAGE], |row| {
             let fs: u64 = row.get(8)?;
             let est_toks: u64 = row.get(9)?;
             let est_cost: f64 = row.get(10)?;
@@ -1467,20 +1546,8 @@ fn compute_stats() -> StatsReport {
             let ast_tokens: u64 = row.get(12)?;
             let text_cost: f64 = row.get(13)?;
             let ast_cost: f64 = row.get(14)?;
-            // Mirror the report front-end's precedence (estimated_* || text − ast)
-            // so a seeded benchmark row whose estimate columns are 0 still feeds the
-            // headline KPIs — otherwise the totals silently disagree with the table.
-            let toks = if est_toks > 0 { est_toks } else { text_tokens.saturating_sub(ast_tokens) };
-            // Clamp cost at 0 here too: legacy rows written before the clamp may
-            // hold a negative estimated_cost_saved_cents, and the text−ast
-            // fallback can also go negative. The headline must never show a loss.
-            let cost = if est_cost != 0.0 { est_cost.max(0.0) } else { (text_cost - ast_cost).max(0.0) };
             let ag_matches: u64 = row.get(2)?;
             let rg_results: u64 = row.get(5)?;
-            total_files_saved += fs;
-            total_false_positives += rg_results.saturating_sub(ag_matches);
-            total_tokens_saved += toks;
-            total_cost_saved += cost;
             Ok(ComparisonStat {
                 pattern: row.get(0)?,
                 lang: row.get(1)?,
@@ -1511,10 +1578,12 @@ fn compute_stats() -> StatsReport {
         errors,
         redirect_rate,
         total_matches_found: total_matches,
-        total_false_positives_avoided: total_false_positives,
-        total_files_saved,
-        total_tokens_saved_estimate: total_tokens_saved,
-        total_cost_saved_cents: total_cost_saved,
+        total_false_positives_avoided: totals.false_positives,
+        total_files_saved: totals.files_saved,
+        total_tokens_saved_estimate: totals.tokens_saved,
+        total_cost_saved_cents: totals.cost_saved_cents,
+        comparison_runs: totals.runs,
+        data_since,
         by_event,
         by_agent,
         by_language,
@@ -1531,6 +1600,7 @@ fn empty_stats() -> StatsReport {
         redirect_rate: 0.0, total_matches_found: 0,
         total_false_positives_avoided: 0,
         total_files_saved: 0, total_tokens_saved_estimate: 0, total_cost_saved_cents: 0.0,
+        comparison_runs: 0, data_since: String::new(),
         by_event: HashMap::new(), by_agent: vec![],
         by_language: HashMap::new(), by_day: vec![],
         top_patterns: vec![], recent_redirects: vec![],
@@ -1613,17 +1683,20 @@ fn print_stats_table() {
         println!("  ─────────────────────────────────────────");
         println!("  {:<25} {:>10} {:>10} {:>10} {:>10}", "PATTERN", "AG FILES", "RG FILES", "SAVED", "EST. TOKENS");
         println!("  {:-<70}", "");
-        let mut total_files_saved = 0u64;
-        let mut total_tokens_saved = 0u64;
         for c in &stats.comparisons {
             println!("  {:<25} {:>10} {:>10} {:>10} {:>10}",
                 c.pattern, c.ag_files, c.rg_files, c.files_saved, c.estimated_tokens_saved);
-            total_files_saved += c.files_saved;
-            total_tokens_saved += c.estimated_tokens_saved;
         }
         println!();
-        println!("  Total files saved:  {:>10}", total_files_saved);
-        println!("  Total tokens saved: {:>10}", total_tokens_saved);
+        // Totals come from the whole table, never from the rows printed above —
+        // summing the displayed page reported a fraction of the real figure and
+        // labelled it "Total".
+        if (stats.comparisons.len() as u64) < stats.comparison_runs {
+            println!("  (showing the {} most recent of {} runs)",
+                stats.comparisons.len(), stats.comparison_runs);
+        }
+        println!("  Total files saved:  {:>10}", stats.total_files_saved);
+        println!("  Total tokens saved: {:>10}", stats.total_tokens_saved_estimate);
         println!();
     }
 }
@@ -2053,6 +2126,97 @@ mod tests {
             render_output(&m, OutputMode::Content { line_numbers: false }),
             "src/a.ts:const deviceId = 1;\n"
         );
+    }
+
+    // ── report totals cover the whole table, not the displayed page ──
+    //
+    // The headline KPIs were summed inside the `ORDER BY id DESC LIMIT 50`
+    // query that feeds the detail TABLE, so "Comparison Runs" read exactly 50
+    // for any database with 50+ rows, and every savings figure described only
+    // the newest 50 rows while the counters beside them were all-time. A live
+    // DB with 402 rows reported 104 files saved instead of 4,748.
+
+    fn seed_comparisons(conn: &Connection, rows: usize) {
+        for i in 0..rows {
+            conn.execute(
+                "INSERT INTO comparisons (pattern, lang, ag_matches, ag_files, ag_time_ms,
+                     rg_results, rg_files, rg_time_ms, files_saved, estimated_tokens_saved,
+                     estimated_cost_saved_cents, text_tokens, ast_tokens, text_cost_cents,
+                     ast_cost_cents, ts)
+                 VALUES ('p', 'typescript', 2, 1, 1, 5, 2, 1, 1, 45, 0.9, 75, 30, 1.5, 0.6, ?1)",
+                rusqlite::params![format!("{}.000Z", 1_750_000_000u64 + i as u64)],
+            )
+            .unwrap();
+        }
+    }
+
+    fn memory_db(rows: usize) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn);
+        seed_comparisons(&conn, rows);
+        conn
+    }
+
+    #[test]
+    fn comparison_runs_counts_every_row_not_just_the_displayed_page() {
+        let totals = comparison_totals(&memory_db(60));
+        assert_eq!(totals.runs, 60, "must not saturate at the 50-row display page");
+    }
+
+    #[test]
+    fn savings_totals_cover_every_row_not_just_the_displayed_page() {
+        let totals = comparison_totals(&memory_db(60));
+        assert_eq!(totals.files_saved, 60);
+        assert_eq!(totals.false_positives, 180, "60 rows x (5 rg - 2 ag)");
+        assert_eq!(totals.tokens_saved, 2700, "60 rows x 45");
+        assert!((totals.cost_saved_cents - 54.0).abs() < 1e-9, "60 rows x 0.9c");
+    }
+
+    #[test]
+    fn totals_fall_back_to_text_minus_ast_when_no_estimate_is_stored() {
+        // Legacy/seeded rows carry 0 in the estimate columns but real
+        // text_/ast_ figures; the totals must mirror the table's precedence.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn);
+        conn.execute(
+            "INSERT INTO comparisons (pattern, lang, ag_matches, ag_files, ag_time_ms,
+                 rg_results, rg_files, rg_time_ms, files_saved, estimated_tokens_saved,
+                 estimated_cost_saved_cents, text_tokens, ast_tokens, text_cost_cents,
+                 ast_cost_cents, ts)
+             VALUES ('p','typescript',2,1,1,5,2,1,3,0,0.0,500,200,10.0,4.0,'1750000000.000Z')",
+            [],
+        )
+        .unwrap();
+        let totals = comparison_totals(&conn);
+        assert_eq!(totals.tokens_saved, 300, "text 500 - ast 200");
+        assert!((totals.cost_saved_cents - 6.0).abs() < 1e-9, "10.0c - 4.0c");
+    }
+
+    #[test]
+    fn a_negative_saving_is_floored_at_zero_never_reported_as_a_loss() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn);
+        conn.execute(
+            "INSERT INTO comparisons (pattern, lang, ag_matches, ag_files, ag_time_ms,
+                 rg_results, rg_files, rg_time_ms, files_saved, estimated_tokens_saved,
+                 estimated_cost_saved_cents, text_tokens, ast_tokens, text_cost_cents,
+                 ast_cost_cents, ts)
+             VALUES ('p','typescript',9,1,1,2,1,1,0,0,0.0,30,135,0.6,2.7,'1750000000.000Z')",
+            [],
+        )
+        .unwrap();
+        let totals = comparison_totals(&conn);
+        assert_eq!(totals.false_positives, 0, "ag > rg is not negative noise");
+        assert_eq!(totals.tokens_saved, 0);
+        assert_eq!(totals.cost_saved_cents, 0.0);
+    }
+
+    #[test]
+    fn empty_table_totals_are_zero() {
+        let totals = comparison_totals(&memory_db(0));
+        assert_eq!(totals.runs, 0);
+        assert_eq!(totals.files_saved, 0);
+        assert_eq!(totals.tokens_saved, 0);
     }
 
     #[test]
