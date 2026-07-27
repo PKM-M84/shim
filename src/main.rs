@@ -269,6 +269,11 @@ fn is_output_mode_long(name: &str) -> bool {
             | "line-number" | "no-line-number"
             | "heading" | "no-heading"
             | "json"
+            // ripgrep's own top-level modes: these print plain text and exit 0,
+            // so surviving into the --json capture would yield a silent false
+            // empty. Such calls pass through upstream anyway; excluding them
+            // here means capture_argv does not depend on that gate.
+            | "files" | "type-list"
     )
 }
 
@@ -323,10 +328,12 @@ fn parse_rg_invocation(args: &[String]) -> RgInvocation {
                 }
                 _ => {}
             }
-            // Capture argv: keep the token unless it's an output-mode flag (it
-            // would beat --json in ripgrep's own mode precedence) or the shim's
-            // own flag (ripgrep has never heard of it).
-            if !is_output_mode_long(name) && name != "no-smart" {
+            // Capture argv: keep the token unless it is an output-mode flag (it
+            // would beat --json in ripgrep's own mode precedence) or a shim-owned
+            // flag. Shim ownership is read back from the index the match arm just
+            // recorded, so there is ONE encoding of that fact, not two.
+            let is_shim = inv.shim_flag_indices.last() == Some(&token_start);
+            if !is_output_mode_long(name) && !is_shim {
                 inv.capture_argv.push(a.clone());
                 if consumed_next {
                     inv.capture_argv.push(value.clone().unwrap());
@@ -3000,6 +3007,26 @@ mod tests {
         assert_eq!(
             capture_command_args(&strs(&["deviceId", "src"])),
             strs(&["--json", "deviceId", "src"])
+        );
+    }
+
+    // ── round 5: ripgrep's own top-level modes, and the composed argv ──
+
+    #[test]
+    fn capture_argv_excludes_ripgreps_own_top_level_modes() {
+        // `rg --json --files src` prints a plain file list and exits 0, so it
+        // would parse to a silent false-empty. Excluded here so capture_argv
+        // does not rely on main()'s gate.
+        assert_eq!(parse(&["--files", "src"]).capture_argv, strs(&["src"]));
+        assert!(parse(&["--type-list"]).capture_argv.is_empty());
+    }
+
+    #[test]
+    fn capture_command_args_composes_with_the_parsers_argv() {
+        let inv = parse(&["-c", "-n", "--heading", "-g", "*.ts", "deviceId", "src"]);
+        assert_eq!(
+            capture_command_args(&inv.capture_argv),
+            strs(&["--json", "-g", "*.ts", "deviceId", "src"])
         );
     }
 }
