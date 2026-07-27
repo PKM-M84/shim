@@ -147,6 +147,7 @@
 const DATA = __SHIM_DATA__;
 const AST_COLOR = '#34d399';
 const TEXT_COLOR = '#6b7280';
+const NO_MATCH_COLOR = '#3f4451';
 const PALETTE = ['#38bdf8','#34d399','#fbbf24','#f87171','#a78bfa','#fb923c','#2dd4bf','#f472b6'];
 
 function escHtml(s) {
@@ -175,9 +176,12 @@ function render(stats) {
 
   const structural = stats.structural || 0;
   const passthrough = stats.passthrough || 0;
-  const rate = stats.total_intercepted > 0
-    ? (structural / stats.total_intercepted * 100).toFixed(1)
-    : '0.0';
+  // Read the backend's own redirect_rate rather than recomputing it here —
+  // it already excludes no_match (rg found nothing, ast-grep never ran) from
+  // the denominator. A duplicate `structural / total_intercepted` calc here
+  // used to distort this rate toward zero for any batch of pure no-match
+  // searches, which have nothing to do with the redirect rate at all.
+  const rate = (stats.redirect_rate || 0).toFixed(1);
 
   const hasComparisons = Array.isArray(stats.comparisons) && stats.comparisons.length > 0;
   // The REAL row count, not stats.comparisons.length — that array is only the
@@ -389,7 +393,10 @@ function render(stats) {
         labels: days.map(d => d.day.slice(5)),
         datasets: [
           { label: 'AST', data: days.map(d => d.structural), backgroundColor: AST_COLOR, borderRadius: 4 },
-          { label: 'Text', data: days.map(d => d.total - d.structural), backgroundColor: TEXT_COLOR, borderRadius: 4 },
+          { label: 'Text', data: days.map(d => d.total - d.structural - (d.no_match || 0)), backgroundColor: TEXT_COLOR, borderRadius: 4 },
+          // No match: rg found nothing at all, so there is no text/AST question
+          // to render for that search — its own series, not folded into "Text".
+          { label: 'No match', data: days.map(d => d.no_match || 0), backgroundColor: NO_MATCH_COLOR, borderRadius: 4 },
         ]
       },
       options: {

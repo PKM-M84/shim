@@ -290,9 +290,23 @@ fn parse_rg_invocation(args: &[String]) -> RgInvocation {
     let mut inv = RgInvocation { path: ".".into(), ..Default::default() };
     let mut positionals: Vec<String> = Vec::new();
     let mut explicit_pattern: Option<String> = None;
+    // Every -e/--regexp AND -f/--file occurrence, counted unconditionally —
+    // including the ones `explicit_pattern.is_none()` below discards. ast-grep
+    // takes exactly one pattern; more than one SOURCE means the call is a
+    // union query (`-e A -e B` == `A|B`) that no single ast-grep pattern can
+    // express, so it must go to real rg whole (see the check after the loop).
+    let mut pattern_sources: u32 = 0;
     let mut i = 0;
 
     while i < args.len() {
+        // Snapshotted once per iteration so its two consumers can never
+        // disagree about which token this pass is about: the `--no-smart`
+        // arm below records it into shim_flag_indices, and is_shim reads
+        // that same push back to decide whether THIS token belongs in
+        // capture_argv. No test can catch a regression here directly
+        // (--no-smart is absent from LONG_VALUE_FLAGS, so the
+        // value-consuming `i += 1` never fires on that path) — the
+        // invariant is held by this comment, not by coverage.
         let token_start = i;
         let a = &args[i];
 
@@ -323,7 +337,19 @@ fn parse_rg_invocation(args: &[String]) -> RgInvocation {
                 inv.unsupported = Some(full.clone());
             }
             match name {
-                "regexp" | "file" => { if explicit_pattern.is_none() { explicit_pattern = value.clone(); } }
+                "regexp" | "file" => {
+                    pattern_sources += 1;
+                    // --file's argument is a FILE OF PATTERNS, not a pattern — the
+                    // parser stores the filename in explicit_pattern, and every
+                    // downstream consumer (classify, translate_pattern, ast-grep
+                    // itself) would filter against that filename as if the user
+                    // had typed it. Unconditional: even the FIRST --file must not
+                    // redirect.
+                    if name == "file" && inv.unsupported.is_none() {
+                        inv.unsupported = Some("-f".to_string());
+                    }
+                    if explicit_pattern.is_none() { explicit_pattern = value.clone(); }
+                }
                 "type" => { if value.is_some() { inv.file_type = value.clone(); } }
                 "glob" => { if let Some(v) = &value { inv.globs.push(v.clone()); } }
                 "count" => inv.count = true,
@@ -382,7 +408,15 @@ fn parse_rg_invocation(args: &[String]) -> RgInvocation {
                         String::new()
                     };
                     match c {
-                        'e' | 'f' => { if explicit_pattern.is_none() { explicit_pattern = Some(value); } }
+                        'e' | 'f' => {
+                            pattern_sources += 1;
+                            // Same rule as --file above: -f's value is a file OF
+                            // patterns, not a pattern.
+                            if c == 'f' && inv.unsupported.is_none() {
+                                inv.unsupported = Some("-f".to_string());
+                            }
+                            if explicit_pattern.is_none() { explicit_pattern = Some(value); }
+                        }
                         't' => inv.file_type = Some(value),
                         'g' => inv.globs.push(value),
                         _ => {}
@@ -409,6 +443,16 @@ fn parse_rg_invocation(args: &[String]) -> RgInvocation {
         positionals.push(a.clone());
         inv.capture_argv.push(a.clone());
         i += 1;
+    }
+
+    // More than one pattern SOURCE (`-e A -e B`, or any mix with -f/--file):
+    // rg answers the union of all of them, but ast-grep only ever gets the
+    // ONE pattern kept above, so filtering the union against a single
+    // pattern silently drops every real hit the other sources produced. A -f
+    // occurrence already forced passthrough above (unconditionally, even
+    // alone); this additionally catches `-e A -e B` (no -f involved).
+    if pattern_sources > 1 && inv.unsupported.is_none() {
+        inv.unsupported = Some("-e (multiple patterns)".to_string());
     }
 
     // ripgrep semantics: with -e/-f the pattern is explicit and ALL positionals
@@ -1515,6 +1559,11 @@ struct StatsReport {
     structural: u64,
     passthrough: u64,
     errors: u64,
+    /// rg found nothing at all — ast-grep never ran. Neither a win nor a
+    /// failure; excluded from `redirect_rate`'s denominator (see
+    /// `redirect_rate()`) so a batch of pure no-match searches can't drag the
+    /// rate down for a change that had nothing to do with them.
+    no_match: u64,
     redirect_rate: f64,
     total_matches_found: u64,
     // Primary headline metric: false-positive matches a naive text search would
@@ -1570,6 +1619,9 @@ struct DayStats {
     day: String,
     total: u64,
     structural: u64,
+    // Its own column, not folded into "total - structural" ("Text"): rg found
+    // nothing, so there is no text/AST question to render for that search.
+    no_match: u64,
 }
 
 #[derive(serde::Serialize)]
@@ -1650,6 +1702,104 @@ fn comparison_totals(conn: &Connection) -> ComparisonTotals {
 /// whole table regardless; this only bounds the rendered rows.
 const COMPARISON_PAGE: usize = 50;
 
+/// Structural redirects as a fraction of searches that had something TO
+/// redirect. `no_match` (rg found nothing; ast-grep never ran) is neither a
+/// win nor a failure, so it must not sit in this denominator — leaving it in
+/// distorts the rate toward zero for searches the change never touched.
+fn redirect_rate(total: u64, structural: u64, no_match: u64) -> f64 {
+    let denom = total.saturating_sub(no_match);
+    if denom > 0 { structural as f64 / denom as f64 * 100.0 } else { 0.0 }
+}
+
+/// By-language counts for structural redirects. `lang` may be a comma-joined
+/// list of every CONFIRMING language in one event (a genuinely polyglot
+/// confirmation — see `lang_label` in main()), so each row is split on ','
+/// and fanned out before accumulating: a "python,typescript" row credits
+/// BOTH "python" and "typescript", instead of becoming its own bucket
+/// distinct from either.
+fn language_counts(conn: &Connection) -> HashMap<String, u64> {
+    let mut counts = HashMap::new();
+    let stmt = conn.prepare(
+        "SELECT lang, COUNT(*) FROM events WHERE event='structural' AND lang != '' GROUP BY lang"
+    ).ok();
+    if let Some(mut s) = stmt {
+        let rows = s.query_map([], |row| {
+            let l: String = row.get(0)?;
+            let c: u64 = row.get(1)?;
+            Ok((l, c))
+        }).ok();
+        if let Some(rows) = rows {
+            for (lang, cnt) in rows.flatten() {
+                for single in lang.split(',').filter(|s| !s.is_empty()) {
+                    *counts.entry(single.to_string()).or_insert(0) += cnt;
+                }
+            }
+        }
+    }
+    counts
+}
+
+/// Top redirected patterns, same comma-split fan-out as `language_counts` —
+/// otherwise a pattern that sometimes confirms alone and sometimes confirms
+/// alongside another language fragments across two (pattern, lang) buckets
+/// instead of one count per language it actually touched.
+fn top_pattern_stats(conn: &Connection) -> Vec<PatternStat> {
+    let mut merged: HashMap<(String, String), u64> = HashMap::new();
+    let stmt = conn.prepare(
+        "SELECT pattern, lang, COUNT(*) as cnt FROM events WHERE event='structural' GROUP BY pattern, lang"
+    ).ok();
+    if let Some(mut s) = stmt {
+        let rows = s.query_map([], |row| {
+            let p: String = row.get(0)?;
+            let l: String = row.get(1)?;
+            let c: u64 = row.get(2)?;
+            Ok((p, l, c))
+        }).ok();
+        if let Some(rows) = rows {
+            for (pattern, lang, cnt) in rows.flatten() {
+                for single in lang.split(',').filter(|s| !s.is_empty()) {
+                    *merged.entry((pattern.clone(), single.to_string())).or_insert(0) += cnt;
+                }
+            }
+        }
+    }
+    let mut top: Vec<PatternStat> = merged
+        .into_iter()
+        .map(|((pattern, lang), count)| PatternStat { pattern, lang, count })
+        .collect();
+    top.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.pattern.cmp(&b.pattern)));
+    top.truncate(10);
+    top
+}
+
+/// Per-day totals, formatted date not epoch. `no_match` is its own column —
+/// see DayStats — so the time chart can give it its own series instead of
+/// folding it into "Text".
+fn day_counts(conn: &Connection) -> Vec<DayStats> {
+    let mut by_day = Vec::new();
+    let stmt = conn.prepare(
+        "SELECT date(substr(ts, 1, 10), 'unixepoch') as day,
+                COUNT(*) as total,
+                COUNT(CASE WHEN event='structural' THEN 1 END) as structural,
+                COUNT(CASE WHEN event='no_match' THEN 1 END) as no_match
+         FROM events GROUP BY day ORDER BY day"
+    ).ok();
+    if let Some(mut s) = stmt {
+        let rows = s.query_map([], |row| {
+            Ok(DayStats {
+                day: row.get(0)?,
+                total: row.get(1)?,
+                structural: row.get(2)?,
+                no_match: row.get(3)?,
+            })
+        }).ok();
+        if let Some(rows) = rows {
+            for r in rows.flatten() { by_day.push(r); }
+        }
+    }
+    by_day
+}
+
 fn compute_stats() -> StatsReport {
     let conn = match open_db() {
         Some(c) => c,
@@ -1690,7 +1840,11 @@ fn compute_stats() -> StatsReport {
         [], |r| r.get(0)
     ).unwrap_or(0);
 
-    let redirect_rate = if total > 0 { structural as f64 / total as f64 * 100.0 } else { 0.0 };
+    let no_match: u64 = conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE event='no_match'", [], |r| r.get(0)
+    ).unwrap_or(0);
+
+    let rate = redirect_rate(total, structural, no_match);
 
     let total_matches: u64 = conn.query_row(
         "SELECT COALESCE(SUM(matches), 0) FROM events WHERE event='structural'",
@@ -1733,60 +1887,15 @@ fn compute_stats() -> StatsReport {
         }
     }
 
-    // By language (structural only)
-    let mut by_language = HashMap::new();
-    let stmt = conn.prepare(
-        "SELECT lang, COUNT(*) FROM events WHERE event='structural' AND lang != '' GROUP BY lang ORDER BY COUNT(*) DESC"
-    ).ok();
-    if let Some(mut s) = stmt {
-        let rows = s.query_map([], |row| {
-            let l: String = row.get(0)?;
-            let c: u64 = row.get(1)?;
-            Ok((l, c))
-        }).ok();
-        if let Some(rows) = rows {
-            for r in rows.flatten() { by_language.insert(r.0, r.1); }
-        }
-    }
+    // By language (structural only) — see language_counts for why the raw
+    // comma-joined `lang` column is split before aggregating.
+    let by_language = language_counts(&conn);
 
     // By day (formatted date, not epoch)
-    let mut by_day = Vec::new();
-    let stmt = conn.prepare(
-        "SELECT date(substr(ts, 1, 10), 'unixepoch') as day,
-                COUNT(*) as total,
-                COUNT(CASE WHEN event='structural' THEN 1 END) as structural
-         FROM events GROUP BY day ORDER BY day"
-    ).ok();
-    if let Some(mut s) = stmt {
-        let rows = s.query_map([], |row| {
-            Ok(DayStats {
-                day: row.get(0)?,
-                total: row.get(1)?,
-                structural: row.get(2)?,
-            })
-        }).ok();
-        if let Some(rows) = rows {
-            for r in rows.flatten() { by_day.push(r); }
-        }
-    }
+    let by_day = day_counts(&conn);
 
-    // Top patterns
-    let mut top_patterns = Vec::new();
-    let stmt = conn.prepare(
-        "SELECT pattern, lang, COUNT(*) as cnt FROM events WHERE event='structural' GROUP BY pattern, lang ORDER BY cnt DESC LIMIT 10"
-    ).ok();
-    if let Some(mut s) = stmt {
-        let rows = s.query_map([], |row| {
-            Ok(PatternStat {
-                pattern: row.get(0)?,
-                lang: row.get(1)?,
-                count: row.get(2)?,
-            })
-        }).ok();
-        if let Some(rows) = rows {
-            for r in rows.flatten() { top_patterns.push(r); }
-        }
-    }
+    // Top patterns — see top_pattern_stats for the same comma-split fan-out.
+    let top_patterns = top_pattern_stats(&conn);
 
     // Recent redirects (with formatted timestamp)
     let mut recent = Vec::new();
@@ -1859,7 +1968,8 @@ fn compute_stats() -> StatsReport {
         structural,
         passthrough,
         errors,
-        redirect_rate,
+        no_match,
+        redirect_rate: rate,
         total_matches_found: total_matches,
         total_false_positives_avoided: totals.false_positives,
         total_files_saved: totals.files_saved,
@@ -1879,7 +1989,7 @@ fn compute_stats() -> StatsReport {
 
 fn empty_stats() -> StatsReport {
     StatsReport {
-        total_intercepted: 0, structural: 0, passthrough: 0, errors: 0,
+        total_intercepted: 0, structural: 0, passthrough: 0, errors: 0, no_match: 0,
         redirect_rate: 0.0, total_matches_found: 0,
         total_false_positives_avoided: 0,
         total_files_saved: 0, total_tokens_saved_estimate: 0, total_cost_saved_cents: 0.0,
@@ -1905,8 +2015,9 @@ fn print_stats_table() {
     println!("\x1b[1m  Overview\x1b[0m");
     println!("  ─────────────────────────────────────────");
     println!("  Total intercepted:    {:>6}", stats.total_intercepted);
-    println!("  Structural redirects: {:>6}  ({:.1}%)", stats.structural, stats.redirect_rate);
+    println!("  Structural redirects: {:>6}  ({:.1}% of searches with something to redirect)", stats.structural, stats.redirect_rate);
     println!("  Passed through (text):{:>6}", stats.passthrough);
+    println!("  No match (rg empty):  {:>6}", stats.no_match);
     println!("  Errors/fallbacks:     {:>6}", stats.errors);
     println!("  Total matches found:  {:>6}", stats.total_matches_found);
     println!();
@@ -2380,6 +2491,48 @@ mod tests {
         assert_eq!(inv.unsupported, None);
     }
 
+    // ── flag fidelity: a call with more than one pattern SOURCE must pass
+    // through, not be filtered against only the first ──
+    //
+    // `explicit_pattern` keeps exactly one -e/--regexp and discards the rest,
+    // which used to be harmless (the kept pattern only decided WHETHER to
+    // redirect; a wrong guess fell through to real rg). Once capture_argv
+    // started forwarding EVERY pattern token to the rg capture, rg started
+    // answering the UNION query while filter_matches kept suppressing
+    // everything that didn't match the ONE retained pattern — silently
+    // deleting real hits. -f/--file has the same defect from a different
+    // angle: its argument is a FILE OF PATTERNS, not a pattern, so the
+    // parser was filtering against the patterns file's own NAME.
+
+    #[test]
+    fn multiple_patterns_force_passthrough() {
+        // rg answers the UNION of every -e; ast-grep takes one pattern, so it
+        // would filter against only the first and delete the rest's real hits.
+        assert!(parse(&["-e", "alphaCall\\(", "-e", "betaCall\\(", "f.py"]).unsupported.is_some());
+        assert!(parse(&["--regexp", "a", "--regexp", "b", "f.py"]).unsupported.is_some());
+    }
+
+    #[test]
+    fn a_single_pattern_still_redirects() {
+        assert_eq!(parse(&["-e", "alphaCall\\(", "f.py"]).unsupported, None);
+    }
+
+    #[test]
+    fn a_patterns_file_forces_passthrough() {
+        // -f's argument is a file OF patterns. The parser stored the FILENAME as
+        // the pattern, so the shim filtered against "queries.txt" itself.
+        assert!(parse(&["-f", "queries.txt", "b.js"]).unsupported.is_some());
+        assert!(parse(&["--file", "queries.txt", "b.js"]).unsupported.is_some());
+    }
+
+    #[test]
+    fn a_patterns_file_still_consumes_its_value() {
+        // Regression guard: -f must stay in short_takes_value, or "queries.txt"
+        // becomes a positional and then the pattern.
+        let inv = parse(&["-f", "queries.txt", "b.js"]);
+        assert_eq!(inv.paths, strs(&["b.js"]), "queries.txt is -f's value, not a path");
+    }
+
     // ── flag fidelity: what ast-grep CAN express must be forwarded ──
     //
     // `ast-grep run` accepts multiple [PATHS] and a --globs flag with gitignore
@@ -2723,6 +2876,89 @@ mod tests {
         assert_eq!(totals.runs, 0);
         assert_eq!(totals.files_saved, 0);
         assert_eq!(totals.tokens_saved, 0);
+    }
+
+    // ── I1: events.lang is a comma-joined list of every CONFIRMING language,
+    // not always one — aggregating on the raw string fragments the KPI it
+    // feeds ──
+    //
+    // log_event's lang_label (main(), the confirming_langs.join(",") call)
+    // joins every language that actually confirmed a hit for a genuinely
+    // polyglot search. A naive `GROUP BY lang` then treats "python,typescript"
+    // as its own bucket, distinct from "python" and "typescript" — the more
+    // successful the polyglot fix is, the more it fragments its own metric.
+
+    fn seed_event(conn: &Connection, event: &str, pattern: &str, lang: &str, matches: u64) {
+        conn.execute(
+            "INSERT INTO events (agent, event, pattern, reason, lang, matches, ts)
+             VALUES ('claude-code', ?1, ?2, 'filtered', ?3, ?4, '1750000000.000Z')",
+            rusqlite::params![event, pattern, lang, matches],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn polyglot_lang_label_is_split_across_its_languages_not_its_own_bucket() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn);
+        // One polyglot redirect (both langs confirmed in the same event) plus
+        // two python-only redirects.
+        seed_event(&conn, "structural", "armingSnapshot($$$)", "python,typescript", 2);
+        seed_event(&conn, "structural", "otherCall($$$)", "python", 3);
+        seed_event(&conn, "structural", "thirdCall($$$)", "python", 1);
+
+        let counts = language_counts(&conn);
+        assert_eq!(counts.get("python"), Some(&3), "2 python-only events + 1 from the polyglot row");
+        assert_eq!(counts.get("typescript"), Some(&1), "only the polyglot row touched typescript");
+        assert_eq!(counts.get("python,typescript"), None, "must not survive as its own bucket");
+    }
+
+    #[test]
+    fn top_patterns_also_splits_the_comma_joined_lang() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn);
+        seed_event(&conn, "structural", "armingSnapshot($$$)", "python,typescript", 1);
+        seed_event(&conn, "structural", "armingSnapshot($$$)", "python", 1);
+
+        let top = top_pattern_stats(&conn);
+        let python_count: u64 = top
+            .iter()
+            .filter(|p| p.pattern == "armingSnapshot($$$)" && p.lang == "python")
+            .map(|p| p.count)
+            .sum();
+        assert_eq!(python_count, 2, "the polyglot row's count must fold into python too");
+        assert!(top.iter().all(|p| p.lang != "python,typescript"), "no composite bucket");
+    }
+
+    // ── I2: no_match (rg found nothing, ast-grep never ran) is neither a win
+    // nor a failure — it must not sit in the redirect-rate denominator, and
+    // it needs its own series rather than being folded into "Text" ──
+
+    #[test]
+    fn redirect_rate_excludes_no_match_from_the_denominator() {
+        // 1 structural win, 3 pure no-match searches: 100% of the searches
+        // that had anything TO redirect were in fact redirected.
+        assert_eq!(redirect_rate(4, 1, 3), 100.0);
+    }
+
+    #[test]
+    fn redirect_rate_is_zero_when_everything_is_a_no_match() {
+        assert_eq!(redirect_rate(3, 0, 3), 0.0, "0/0 after excluding no_match must not divide by zero");
+    }
+
+    #[test]
+    fn day_counts_carries_no_match_as_its_own_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn);
+        seed_event(&conn, "structural", "p", "python", 1);
+        seed_event(&conn, "no_match", "p2", "", 0);
+        seed_event(&conn, "no_match", "p3", "", 0);
+
+        let days = day_counts(&conn);
+        assert_eq!(days.len(), 1);
+        assert_eq!(days[0].total, 3);
+        assert_eq!(days[0].structural, 1);
+        assert_eq!(days[0].no_match, 2);
     }
 
     #[test]

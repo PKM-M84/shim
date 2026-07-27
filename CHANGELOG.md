@@ -65,7 +65,7 @@ both deleted; `run_ast_grep_on_files` (explicit file list, not a directory
 walk, so ripgrep and ast-grep can no longer disagree about ignore rules)
 replaces them.
 
-Covered by `cargo test` (110 tests) — including containment against a
+Covered by `cargo test` (119 tests) — including containment against a
 synthetic multi-line node span, the one case a realistic fixture cannot
 produce, since ripgrep matches the very text that seeds the ast-grep node —
 and end-to-end against the release binary: polyglot symbols found in every
@@ -75,6 +75,28 @@ restoring ripgrep's raw output, and a true no-match exiting 1 and logging
 `no_match/rg_empty`. The v0.3.13 nine-flag passthrough matrix (`-v`,
 `--invert-match`, `-A2`, `-C 1`, `-i`, `-m1`, `-o`, `-F`,
 `--files-without-match`) remains byte-identical to real ripgrep.
+
+### Fixed — two shapes of the inversion that silently dropped real hits
+
+`explicit_pattern` keeps exactly one `-e`/`--regexp` and discards the rest —
+harmless before this release, when that single pattern only decided WHETHER
+to redirect. Once `capture_argv` started forwarding every pattern token to
+the rg capture, ripgrep began answering the *union* of all of them while
+ast-grep kept filtering against the one pattern that survived, silently
+deleting every hit that only matched a *different* one:
+
+- **`rg -e A -e B`** (the flag spelling of an alternation, already out of
+  scope for redirect) now forces passthrough instead of returning only the
+  hits that matched `A`.
+- **`rg -f patterns.txt`** now forces passthrough instead of filtering
+  against the patterns *file's own name* — the parser stored the filename in
+  `explicit_pattern`, so a search for what the file listed was silently
+  answered as a search for the string `patterns.txt`.
+
+Both are semantics a single ast-grep pattern cannot express, so both now set
+`inv.unsupported` and go to real ripgrep whole — the same mechanism that
+already covers `-v`, `-C`, `-i`, and the rest of the deny-list. Verified
+byte-identical to real ripgrep on both shapes against the release binary.
 
 ## [0.3.14] - 2026-07-26
 
