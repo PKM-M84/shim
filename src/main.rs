@@ -1093,6 +1093,26 @@ fn translate_pattern(pattern: &str) -> String {
 }
 
 // ── log_comparison (inserts into comparisons with ROI fields + rate limit) ─
+/// Average tokens an agent spends reading one match line (`path:line:text`).
+/// A rough constant, not a measurement — it scales both sides of the
+/// comparison identically, so it cancels out of the *ratio* and only sets the
+/// absolute scale of the token and cost figures.
+const TOKENS_PER_MATCH: u64 = 15;
+
+/// Input price per million tokens, in USD. Claude Opus 5 charges $5.00/MTok
+/// input (output is $25.00/MTok but never applies here — search results are
+/// tokens the model *reads*, never tokens it writes).
+///
+/// This is the single definition. `compute_stats` hands it to the report as
+/// `input_cost_per_mtok` so the HTML doesn't carry a second copy that could
+/// drift. Change it here and every figure, historical rows included, reprices.
+const INPUT_COST_PER_MTOK_USD: f64 = 5.00;
+
+/// Tokens -> cents at the configured input rate.
+fn cents_for(tokens: u64) -> f64 {
+    tokens as f64 * INPUT_COST_PER_MTOK_USD / 10_000.0
+}
+
 fn log_comparison(
     pattern: &str,
     lang: &str,
@@ -1104,12 +1124,14 @@ fn log_comparison(
     rg_time_ms: u64,
 ) {
     let files_saved = rg_files.saturating_sub(ag_files);
-    let ast_tokens = ag_matches.saturating_mul(15);
-    let text_tokens = rg_results.saturating_mul(15);
+    let ast_tokens = ag_matches.saturating_mul(TOKENS_PER_MATCH);
+    let text_tokens = rg_results.saturating_mul(TOKENS_PER_MATCH);
     let estimated_tokens_saved = text_tokens.saturating_sub(ast_tokens);
-    // $2 per million tokens => cents = tokens * 0.0002
-    let text_cost_cents = text_tokens as f64 * 0.0002;
-    let ast_cost_cents = ast_tokens as f64 * 0.0002;
+    // Stored for anyone reading the DB directly. Display does NOT read these —
+    // it re-derives from the token counts (see cents_for), so that changing the
+    // rate reprices all history instead of blending old and new rates in one KPI.
+    let text_cost_cents = cents_for(text_tokens);
+    let ast_cost_cents = cents_for(ast_tokens);
     // Clamp at 0: the shim never "costs" money. When ast-grep finds more real
     // matches than a literal text search (e.g. degenerate test patterns), the
     // raw difference is negative — but a negative "saving" is meaningless and
@@ -1584,6 +1606,11 @@ struct StatsReport {
     data_since: String,
     total_tokens_saved_estimate: u64,
     total_cost_saved_cents: f64,
+    /// Tokens assumed per match, and the input $/MTok used to price them.
+    /// Exported so the report can label its own figures and derive per-row
+    /// cost without keeping a second copy of the rate that could drift.
+    tokens_per_match: u64,
+    input_cost_per_mtok: f64,
     by_event: HashMap<String, u64>,
     by_agent: Vec<AgentStats>,
     by_language: HashMap<String, u64>,
@@ -1672,6 +1699,12 @@ fn comparison_totals(conn: &Connection) -> ComparisonTotals {
     // Mirrors the report front-end's precedence (estimated_* when present, else
     // text − ast) and its never-negative floor — but over EVERY row, so the
     // headline totals and the detail table can no longer tell different stories.
+    //
+    // Cost is NOT summed from the stored per-row cents. Those were priced at
+    // whatever rate was compiled in the day the row was written, so summing them
+    // blends rates and quietly misreports the total the moment the rate changes.
+    // Cost is linear in tokens at a single rate, so cost_saved is exactly
+    // cents_for(tokens_saved) — derive it and the two KPIs cannot disagree.
     conn.query_row(
         "SELECT
             COUNT(*),
@@ -1679,19 +1712,17 @@ fn comparison_totals(conn: &Connection) -> ComparisonTotals {
             COALESCE(SUM(MAX(rg_results - ag_matches, 0)), 0),
             COALESCE(SUM(CASE WHEN estimated_tokens_saved > 0
                               THEN estimated_tokens_saved
-                              ELSE MAX(text_tokens - ast_tokens, 0) END), 0),
-            COALESCE(SUM(CASE WHEN estimated_cost_saved_cents != 0.0
-                              THEN MAX(estimated_cost_saved_cents, 0.0)
-                              ELSE MAX(text_cost_cents - ast_cost_cents, 0.0) END), 0.0)
+                              ELSE MAX(text_tokens - ast_tokens, 0) END), 0)
          FROM comparisons",
         [],
         |r| {
+            let tokens_saved: u64 = r.get(3)?;
             Ok(ComparisonTotals {
                 runs: r.get(0)?,
                 files_saved: r.get(1)?,
                 false_positives: r.get(2)?,
-                tokens_saved: r.get(3)?,
-                cost_saved_cents: r.get(4)?,
+                tokens_saved,
+                cost_saved_cents: cents_for(tokens_saved),
             })
         },
     )
@@ -1981,6 +2012,8 @@ fn compute_stats() -> StatsReport {
         total_files_saved: totals.files_saved,
         total_tokens_saved_estimate: totals.tokens_saved,
         total_cost_saved_cents: totals.cost_saved_cents,
+        tokens_per_match: TOKENS_PER_MATCH,
+        input_cost_per_mtok: INPUT_COST_PER_MTOK_USD,
         comparison_runs: totals.runs,
         data_since,
         by_event,
@@ -1999,6 +2032,7 @@ fn empty_stats() -> StatsReport {
         redirect_rate: 0.0, total_matches_found: 0,
         total_false_positives_avoided: 0,
         total_files_saved: 0, total_tokens_saved_estimate: 0, total_cost_saved_cents: 0.0,
+        tokens_per_match: TOKENS_PER_MATCH, input_cost_per_mtok: INPUT_COST_PER_MTOK_USD,
         comparison_runs: 0, data_since: String::new(),
         by_event: HashMap::new(), by_agent: vec![],
         by_language: HashMap::new(), by_day: vec![],
@@ -2149,6 +2183,38 @@ fn generate_report(output_path: &str, open_browser: bool) {
 
 #[cfg(test)]
 mod tests {
+    // ── pricing ────────────────────────────────────────────────────────────
+    // These pin the rate itself, so a silent edit to INPUT_COST_PER_MTOK_USD
+    // has to be a deliberate one that updates the expected values too.
+
+    #[test]
+    fn one_million_tokens_costs_the_opus_5_input_rate() {
+        // $5.00/MTok input. cents_for returns CENTS, so a million tokens = 500c.
+        assert_eq!(cents_for(1_000_000), 500.0);
+    }
+
+    #[test]
+    fn cost_is_linear_in_tokens() {
+        // comparison_totals relies on this identity: it derives the aggregate
+        // cost saving as cents_for(sum_of_tokens_saved) rather than summing
+        // per-row cost. That is only correct if cost is exactly linear.
+        let a = 4_321_u64;
+        let b = 1_234_u64;
+        let saved = a - b;
+        assert!((cents_for(a) - cents_for(b) - cents_for(saved)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn zero_tokens_costs_nothing() {
+        assert_eq!(cents_for(0), 0.0);
+    }
+
+    #[test]
+    fn a_match_is_priced_at_the_declared_token_width() {
+        // One match at 15 tokens, $5/MTok => 15 * 5 / 1e6 dollars = 0.0075c.
+        assert!((cents_for(TOKENS_PER_MATCH) - 0.0075).abs() < 1e-9);
+    }
+
     use super::*;
 
     fn parse(tokens: &[&str]) -> RgInvocation {
@@ -2838,7 +2904,9 @@ mod tests {
         assert_eq!(totals.files_saved, 60);
         assert_eq!(totals.false_positives, 180, "60 rows x (5 rg - 2 ag)");
         assert_eq!(totals.tokens_saved, 2700, "60 rows x 45");
-        assert!((totals.cost_saved_cents - 54.0).abs() < 1e-9, "60 rows x 0.9c");
+        // Derived from the token total at the current rate, not summed from the
+        // rows' stored cents: 2700 tokens @ $5.00/MTok = 1.35c.
+        assert!((totals.cost_saved_cents - 1.35).abs() < 1e-9, "2700 tok @ $5/M");
     }
 
     #[test]
@@ -2858,7 +2926,14 @@ mod tests {
         .unwrap();
         let totals = comparison_totals(&conn);
         assert_eq!(totals.tokens_saved, 300, "text 500 - ast 200");
-        assert!((totals.cost_saved_cents - 6.0).abs() < 1e-9, "10.0c - 4.0c");
+        // The row stores 10.0c/4.0c, priced at whatever rate was compiled in
+        // when it was written. The total must IGNORE those and reprice from the
+        // token counts (300 @ $5/MTok = 0.15c) — otherwise a rate change leaves
+        // the headline KPI silently blending old and new prices.
+        assert!(
+            (totals.cost_saved_cents - 0.15).abs() < 1e-9,
+            "must reprice from tokens, not sum the stored 10.0c - 4.0c"
+        );
     }
 
     #[test]
