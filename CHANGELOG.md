@@ -5,6 +5,51 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.14] - 2026-07-26
+
+### Fixed — the report's headline numbers describe the whole dataset
+
+- **Every savings KPI was a page, not a total.** The headline figures were
+  summed inside the `ORDER BY id DESC LIMIT 50` query that feeds the detail
+  table, and `report.html` set "Comparison Runs" from `comparisons.length` —
+  the length of that page. So the KPI read exactly `50` for any database past
+  50 rows, and the savings beside it covered only the newest 50 while the
+  counters next to *them* were all-time. Totals now come from a separate
+  whole-table aggregate. On a live 402-row database:
+
+  | KPI | was | now |
+  |---|---|---|
+  | Comparison runs | 50 | 402 |
+  | Files saved | 104 | 4,748 |
+  | Noise avoided | 734 | 760,733 |
+  | Est. cost saved | $0.02 | $22.82 |
+
+  This is also why earlier fixes "worked and then quit": a sliding
+  most-recent-N window re-decays as rows land. The window is gone, not retuned.
+- **`smart-rg stats` had the same bug** — it summed the printed rows and
+  labelled the result "Total".
+- **Generating a report silently deleted data.** `compute_stats` ran a lazy
+  30-day `prune_old_events` on every `stats`/`report` invocation, while
+  `comparisons` was never pruned — one page mixed a 30-day event window with an
+  all-time comparison table. Viewing a report no longer mutates the database;
+  retention remains available as the explicit `smart-rg prune` command.
+- **The page now states its window** ("All data since YYYY-MM-DD"), and the
+  detail table says when it is showing a subset.
+
+### Fixed — the savings metric compares like with like
+
+- **The ripgrep baseline counted LINES; ast-grep counts OCCURRENCES.**
+  `run_rg_count` used `--count` (matching lines) against ast-grep's node count,
+  so two occurrences on one line scored rg=1 vs ag=2. That produced rows where
+  the text tool appears to find *less* than the structural one — 96 of 402 rows
+  on a live database — and systematically understated the noise avoided. Now
+  uses `--count-matches`.
+- Combined with the flag fidelity fixes in 0.3.13 (all paths and `-g` globs
+  forwarded, unsupported flags never redirected), both sides of a comparison
+  finally measure the same search. Previously `rg PATTERN src other` searched
+  only `src` with ast-grep, then booked the unsearched directory as
+  `files_saved`.
+
 ## [0.3.13] - 2026-07-26
 
 ### Fixed — a redirected search must answer the question that was asked
