@@ -810,6 +810,27 @@ fn ext_to_lang(ext: &str) -> Option<&'static str> {
     }
 }
 
+/// Group the files ripgrep actually matched by language.
+///
+/// This replaces inferring ONE dominant language from a filesystem walk. On a
+/// polyglot repo that guess is usually wrong: the live event log shows
+/// `arming_snapshot` attempted as python, javascript and typescript — eleven
+/// empty runs for one symbol. The files that matched cannot be wrong about
+/// their own extension. BTreeMap keeps the ast-grep spawn order deterministic.
+fn group_files_by_lang(files: &[String]) -> BTreeMap<&'static str, Vec<String>> {
+    let mut groups: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+    for f in files {
+        let ext = std::path::Path::new(f)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        if let Some(lang) = ext_to_lang(ext) {
+            groups.entry(lang).or_default().push(f.clone());
+        }
+    }
+    groups
+}
+
 // ── Classification ───────────────────────────────────────────
 
 /// Reduce a pattern to its literal text when its only regex syntax is escaped
@@ -2648,5 +2669,29 @@ mod tests {
         let args = strs(&["--no-smart=true", "deviceId", "src"]);
         assert_eq!(strip_shim_flags(&args, &inv.shim_flag_indices),
             strs(&["deviceId", "src"]), "the =value spelling must strip too");
+    }
+
+    // ── language comes from the files that MATCHED ──
+
+    #[test]
+    fn polyglot_hits_split_into_one_group_per_language() {
+        let groups = group_files_by_lang(&strs(&["svc/a.py", "web/b.ts", "svc/c.py"]));
+        assert_eq!(groups.get("python"), Some(&strs(&["svc/a.py", "svc/c.py"])));
+        assert_eq!(groups.get("typescript"), Some(&strs(&["web/b.ts"])));
+        assert_eq!(groups.len(), 2);
+    }
+
+    #[test]
+    fn files_with_no_known_language_are_dropped() {
+        let groups = group_files_by_lang(&strs(&["README.md", "data.csv", "a.py"]));
+        assert_eq!(groups.len(), 1);
+        assert!(groups.contains_key("python"));
+    }
+
+    #[test]
+    fn grouping_is_deterministic() {
+        let groups = group_files_by_lang(&strs(&["b.ts", "a.py"]));
+        let langs: Vec<&str> = groups.keys().copied().collect();
+        assert_eq!(langs, vec!["python", "typescript"], "BTreeMap orders by language");
     }
 }
