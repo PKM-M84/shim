@@ -5,6 +5,33 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.16] - 2026-07-27
+
+### Fixed — C++ searches were getting no structural filtering at all
+
+`ext_to_lang` mapped `.cpp`/`.cc`/`.cxx`/`.hpp`/`.hh` to ast-grep's **C**
+grammar. ast-grep gates on file extension, so that did not merely pick a
+weaker grammar — it made ast-grep skip those files entirely. Every C++ search
+returned ripgrep's raw hits, comments and strings included, while still paying
+for a spawn that could never match anything:
+
+```
+$ smart-rg -n 'render_chart\(' w.cpp        # before
+w.cpp:2:  void run() { render_chart(data_); }
+w.cpp:3:  // render_chart(old) was removed    <-- comment not suppressed
+```
+
+The C grammar could not have served those files anyway: `--debug-query=ast`
+shows `render_chart($$$)` parsing as a `macro_type_specifier` — a *type* —
+under `-l c`, and as a `call_expression` under `-l cpp`. C++ now uses `cpp`,
+which ast-grep supports natively, and the comment above is suppressed.
+
+`.c` and `.h` keep the C grammar deliberately. It still cannot express a call
+pattern, but it does match bare identifiers, and ast-grep accepts a `.h` file
+under neither `c` nor `cpp` for calls — so there is no better mapping to make.
+Those searches keep every hit, because a language that confirms nothing is
+treated as unsearched rather than as a wipeout (v0.3.15).
+
 ## [0.3.15] - 2026-07-27
 
 ### Changed — invert the pipeline: ripgrep runs first, ast-grep filters its hits
