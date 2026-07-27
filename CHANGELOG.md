@@ -5,6 +5,26 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- `install.sh` now stages, verifies, and atomically swaps the shim into place
+  instead of copying straight onto it. `~/.smart-rg/bin/rg` is first on PATH, so
+  a half-written or non-runnable binary there breaks every `rg` on the machine —
+  including Claude Code's Grep tool. The new sequence copies into a staging dir
+  inside `$SRG_BIN` (same filesystem, so the rename is atomic), runs the binary
+  to confirm it executes and self-identifies, and only then moves it over. A
+  corrupt download, an interrupted copy, or a wrong-arch build now aborts with
+  the previous install untouched and still working.
+
+### Added
+- CI installs a second time over an existing install. Every run before this
+  installed once on a clean runner, so the upgrade path — the one every user
+  takes on every release — was never exercised. The new step asserts the layout
+  survives (`rg` a real file, `smart-rg` a *relative* symlink to it, `rg2`
+  intact), both entry points still work, no staging dirs leak, and re-running
+  does not append a second PATH block to the shell rc.
+
 ## [0.3.17] - 2026-07-27
 
 ### Changed

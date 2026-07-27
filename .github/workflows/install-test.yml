@@ -47,6 +47,41 @@ jobs:
           python3 -c "import json,os; \
             d=json.load(open(os.path.expanduser('~/.claude/settings.json'))); \
             assert d['env']['USE_BUILTIN_RIPGREP']=='0', d"
+      # Every CI run before this installed exactly once, on a clean runner —
+      # so the upgrade path, which is what every real user hits on every
+      # release, was never exercised. Install again over the top and assert the
+      # layout survives and nothing is duplicated.
+      - name: re-install over an existing install (the upgrade path)
+        run: |
+          set -euo pipefail
+          before="$("$HOME/.smart-rg/bin/smart-rg" --version)"
+          bash install.sh
+          after="$("$HOME/.smart-rg/bin/smart-rg" --version)"
+          [ "$before" = "$after" ] || { echo "version changed: $before -> $after"; exit 1; }
+
+          # Layout must be identical to a first install, not degraded.
+          test -f "$HOME/.smart-rg/bin/rg"           # real file, not a symlink
+          test ! -L "$HOME/.smart-rg/bin/rg"
+          test -x "$HOME/.smart-rg/bin/rg"
+          test -L "$HOME/.smart-rg/bin/smart-rg"     # still a symlink...
+          [ "$(readlink "$HOME/.smart-rg/bin/smart-rg")" = "rg" ]  # ...still RELATIVE
+          test -L "$HOME/.smart-rg/bin/rg2"
+
+          # Both entry points still work, and rg still impersonates ripgrep.
+          "$HOME/.smart-rg/bin/smart-rg" stats >/dev/null
+          "$HOME/.smart-rg/bin/rg" --version | grep -q '^ripgrep '
+
+          # Staging dirs are cleaned up; none may survive a successful install.
+          ! ls -a "$HOME/.smart-rg/bin" | grep -q '^\.stage\.'
+
+          # Re-running must not append a second PATH block to the shell rc.
+          for f in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile"; do
+            [ -f "$f" ] || continue
+            n="$(grep -cF '# >>> smart-rg >>>' "$f" || true)"
+            [ "$n" -le 1 ] || { echo "$f has $n smart-rg blocks after re-install"; exit 1; }
+          done
+          echo "re-install clean ✓"
+
       - name: uninstall removes everything cleanly
         run: |
           set -euo pipefail
