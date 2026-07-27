@@ -5,6 +5,40 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.13] - 2026-07-26
+
+### Fixed — a redirected search must answer the question that was asked
+
+`run_ast_grep` honoured only `-c` and `-l`; every other flag was silently
+dropped, so a redirect could answer a *different question* than the caller
+asked. Measured against real ripgrep on a fixture (see #14).
+
+- **`-v` returned the exact opposite of the truth.** An inverted search
+  reported the *matching* lines instead of the non-matching ones. Flags whose
+  semantics ast-grep cannot reproduce now force passthrough with a logged
+  `unsupported_flag_<flag>` reason: `-v`/`--invert-match`,
+  `--files-without-match`, `-A`/`-B`/`-C` (context), `-o`, `-m`,
+  `-i`/`-S` (ast-grep matching is case-sensitive), `-F`, `-r`, `-q`, `--json`,
+  `--iglob`. This is a small deny-list of *semantics*, not a re-enumeration of
+  rg's flag surface — unknown flags stay harmless as before.
+- **Every redirected hit pointed one line too high.** ast-grep's JSON
+  `range.start.line` is 0-indexed and was printed raw; ripgrep reports
+  1-indexed lines.
+- **Only the first path was searched.** `rg PATTERN src other` silently
+  dropped `other/` — and then *credited the miss as a saving*, because
+  `files_saved` compared rg's full walk against ast-grep's partial one.
+  `ast-grep run` takes multiple `[PATHS]`, so all of them are now forwarded.
+- **`-g/--glob` had no effect.** Forwarded to ast-grep's `--globs`, which takes
+  the same gitignore-style syntax including `!` negation.
+- **`-c` printed a bare total.** ripgrep prints `path:count` per file, and a
+  bare count only for a single explicitly-named file. Both shapes now match.
+- **The line-number field was emitted unconditionally.** Piped `rg PATTERN src`
+  prints `file:content`; `-n`/`-N` are now honoured, defaulting to ripgrep's
+  own rule (on for a TTY, off when piped).
+
+Note: 0.3.10–0.3.12 shipped without changelog entries; this entry does not
+backfill them.
+
 ## [0.3.9] - 2026-06-10
 
 ### Fixed — stop hijacking pattern-less rg modes (the real "stats quit again" bug)
