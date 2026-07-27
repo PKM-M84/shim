@@ -1111,10 +1111,11 @@ fn parse_rg_json(stdout: &str) -> Vec<RgMatch> {
             Some(RgMatch {
                 file: d.get("path")?.get("text")?.as_str()?.to_string(),
                 line: d.get("line_number")?.as_u64()?,
-                // ripgrep includes the trailing newline; strip it so rendering
-                // controls line breaks.
+                // ripgrep includes the trailing line terminator (\n on Unix, \r\n
+                // on Windows). Strip both so rendering controls line breaks.
                 text: d.get("lines")?.get("text")?.as_str()?
                     .trim_end_matches('\n')
+                    .trim_end_matches('\r')
                     .to_string(),
             })
         })
@@ -2433,5 +2434,17 @@ mod tests {
     #[test]
     fn empty_stream_yields_no_matches() {
         assert!(parse_rg_json("").is_empty());
+    }
+
+    #[test]
+    fn crlf_line_endings_leave_no_stray_carriage_return() {
+        // Real `rg --json` emits "text\r\n" for a CRLF-terminated line. Stripping
+        // only '\n' baked a '\r' into every match from a Windows-authored file.
+        let stream = format!(
+            r#"{{"type":"match","data":{{"path":{{"text":"win.ts"}},"lines":{{"text":"const deviceId = 1;\r\n"}},"line_number":1,"absolute_offset":0,"submatches":[]}}}}"#
+        );
+        let m = parse_rg_json(&stream);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].text, "const deviceId = 1;", "no trailing \\r");
     }
 }
