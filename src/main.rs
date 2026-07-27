@@ -915,7 +915,13 @@ fn ext_to_lang(ext: &str) -> Option<&'static str> {
         "rb" => Some("ruby"),
         "java" => Some("java"),
         "c" | "h" => Some("c"),
-        "cpp" | "cc" | "cxx" | "hpp" | "hh" => Some("c"),
+        // C++ gets its OWN grammar, not C's. ast-grep gates on file extension, so
+        // mapping these to "c" made it skip the files entirely rather than use a
+        // weaker grammar — zero filtering for every C++ search, at the cost of a
+        // spawn. The C grammar also cannot parse a call pattern: `render_chart($$$)`
+        // parses as a macro_type_specifier (a TYPE) under `-l c`, and as a
+        // call_expression under `-l cpp`.
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" => Some("cpp"),
         "css" => Some("css"),
         "html" | "htm" => Some("html"),
         "swift" => Some("swift"),
@@ -3139,6 +3145,37 @@ mod tests {
         let groups = group_files_by_lang(&strs(&["README.md", "data.csv", "a.py"]));
         assert_eq!(groups.len(), 1);
         assert!(groups.contains_key("python"));
+    }
+
+    #[test]
+    fn cpp_sources_map_to_the_cpp_grammar_not_c() {
+        // ast-grep GATES ON EXTENSION: with `.cpp` mapped to "c" it does not use
+        // a weaker grammar, it skips the file entirely — so every C++ search got
+        // zero filtering while still costing a spawn. And the C grammar cannot
+        // parse a call pattern anyway: `--debug-query=ast` shows
+        // `render_chart($$$)` parsing as a macro_type_specifier (a TYPE) under
+        // `-l c`, but as a call_expression under `-l cpp`.
+        for ext in ["cpp", "cc", "cxx", "hpp", "hh"] {
+            assert_eq!(ext_to_lang(ext), Some("cpp"), ".{ext} must use the cpp grammar");
+        }
+    }
+
+    #[test]
+    fn plain_c_sources_still_map_to_c() {
+        // `.c`/`.h` keep the C grammar: it cannot express a call pattern, but it
+        // does match bare identifiers, which is real value. ast-grep accepts
+        // neither `-l c` nor `-l cpp` for a `.h` call pattern, so there is no
+        // better mapping available.
+        assert_eq!(ext_to_lang("c"), Some("c"));
+        assert_eq!(ext_to_lang("h"), Some("c"));
+    }
+
+    #[test]
+    fn cpp_files_group_under_their_own_language() {
+        let groups = group_files_by_lang(&strs(&["gfx/widget.cpp", "gfx/util.c"]));
+        assert_eq!(groups.get("cpp"), Some(&strs(&["gfx/widget.cpp"])));
+        assert_eq!(groups.get("c"), Some(&strs(&["gfx/util.c"])));
+        assert_eq!(groups.len(), 2, "C and C++ are separate ast-grep languages");
     }
 
     #[test]
