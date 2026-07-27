@@ -10,7 +10,7 @@
 
 use clap::{Parser, Subcommand};
 use rusqlite::Connection;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -157,6 +157,50 @@ struct RgInvocation {
     // stdin, so any call that reads stdin must pass through to real rg — even
     // when stdin is a TTY (the user asked for it explicitly).
     reads_stdin: bool,
+    // EVERY positional path (minus `-`). `ast-grep run` takes multiple [PATHS],
+    // so all of them are forwarded; searching only the first silently dropped
+    // whole directories from the answer.
+    paths: Vec<String>,
+    // `-g/--glob` values, forwarded to ast-grep's `--globs` (same gitignore-style
+    // syntax including `!` negation), so a file filter the caller asked for is
+    // actually applied instead of ignored.
+    globs: Vec<String>,
+    // The first flag found whose SEMANTICS ast-grep cannot reproduce. Set → the
+    // whole call must go to real rg (see UNSUPPORTED_LONG / unsupported_short).
+    unsupported: Option<String>,
+    // -n/--line-number → Some(true), -N/--no-line-number → Some(false), unset →
+    // None, meaning rg's own default (on for a TTY, off when piped).
+    line_numbers: Option<bool>,
+}
+
+// Flags that change WHICH lines match, or the shape of the output, in a way
+// ast-grep has no equivalent for. A redirect would silently answer a different
+// question than the caller asked — `-v` most starkly, which returned the
+// matching lines instead of the non-matching ones. Passing these through costs
+// only a missed optimisation; redirecting them costs a wrong answer.
+//
+// This is a deny-list of SEMANTICS, not an attempt to enumerate rg's flag
+// surface (the mistake that made the old clap parser brittle). Unknown flags
+// stay harmless, exactly as before.
+const UNSUPPORTED_LONG: &[&str] = &[
+    // inverted selection
+    "invert-match", "files-without-match",
+    // context lines around a match
+    "after-context", "before-context", "context",
+    // altered match extent / capping
+    "only-matching", "max-count",
+    // case-folding: ast-grep matching is case-sensitive
+    "ignore-case", "smart-case", "iglob",
+    // literal-text and rewrite semantics
+    "fixed-strings", "replace",
+    // output shapes the shim does not emit
+    "quiet", "json",
+];
+
+// Short forms of the same set. Case matters: `-c` (count) is supported,
+// `-C` (context) is not.
+fn unsupported_short(c: char) -> bool {
+    matches!(c, 'v' | 'A' | 'B' | 'C' | 'o' | 'm' | 'i' | 'S' | 'F' | 'r' | 'q')
 }
 
 // Long flags that take a separate VALUE token (the `--flag value` form). The
@@ -211,12 +255,18 @@ fn parse_rg_invocation(args: &[String]) -> RgInvocation {
                 value = Some(args[i + 1].clone());
                 i += 1; // consume the value token
             }
+            if UNSUPPORTED_LONG.contains(&name) && inv.unsupported.is_none() {
+                inv.unsupported = Some(full.clone());
+            }
             match name {
                 "regexp" | "file" => { if explicit_pattern.is_none() { explicit_pattern = value; } }
                 "type" => { if value.is_some() { inv.file_type = value; } }
+                "glob" => { if let Some(v) = value { inv.globs.push(v); } }
                 "count" => inv.count = true,
                 "files-with-matches" => inv.files_with_matches = true,
                 "files" | "type-list" => inv.pattern_less = true,
+                "line-number" => inv.line_numbers = Some(true),
+                "no-line-number" => inv.line_numbers = Some(false),
                 _ => {}
             }
             i += 1;
@@ -231,9 +281,14 @@ fn parse_rg_invocation(args: &[String]) -> RgInvocation {
             let mut idx = 0;
             while idx < chars.len() {
                 let c = chars[idx];
+                if unsupported_short(c) && inv.unsupported.is_none() {
+                    inv.unsupported = Some(format!("-{c}"));
+                }
                 match c {
                     'c' => inv.count = true,
                     'l' => inv.files_with_matches = true,
+                    'n' => inv.line_numbers = Some(true),
+                    'N' => inv.line_numbers = Some(false),
                     _ => {}
                 }
                 if short_takes_value(c) {
@@ -250,6 +305,7 @@ fn parse_rg_invocation(args: &[String]) -> RgInvocation {
                     match c {
                         'e' | 'f' => { if explicit_pattern.is_none() { explicit_pattern = Some(value); } }
                         't' => inv.file_type = Some(value),
+                        'g' => inv.globs.push(value),
                         _ => {}
                     }
                     break; // the rest of the bundle is this flag's value
@@ -283,9 +339,11 @@ fn parse_rg_invocation(args: &[String]) -> RgInvocation {
         &[]
     };
     // A positional `-` is stdin, not a path. Record it so main forwards the
-    // call, and pick the first NON-dash positional as the real search path.
+    // call, and keep every real path — ast-grep searches all of them. `path`
+    // stays the first one, which is what language inference reads.
     inv.reads_stdin = paths.iter().any(|p| p == "-");
-    if let Some(p) = paths.iter().find(|p| p.as_str() != "-") {
+    inv.paths = paths.iter().filter(|p| p.as_str() != "-").cloned().collect();
+    if let Some(p) = inv.paths.first() {
         inv.path = p.clone();
         inv.has_path = true;
     }
@@ -451,6 +509,15 @@ fn main() {
     if inv.reads_stdin || is_stream_filter(inv.has_path, std::io::stdin().is_terminal()) {
         let reason = if inv.reads_stdin { "stdin_dash" } else { "stream_stdin" };
         log_event("passthrough", &pattern, reason, None, 0);
+        exec_real_rg(&args[1..]);
+    }
+
+    // Flag-fidelity guard: a flag whose semantics ast-grep cannot reproduce
+    // (invert, context, case-folding, capping, …) would make a redirect answer a
+    // DIFFERENT question than the caller asked. Forward the call verbatim so the
+    // answer is right; the lost redirect is only a lost optimisation.
+    if let Some(flag) = inv.unsupported.clone() {
+        log_event("passthrough", &pattern, &format!("unsupported_flag_{flag}"), None, 0);
         exec_real_rg(&args[1..]);
     }
 
@@ -965,6 +1032,98 @@ fn log_comparison(
     })();
 }
 
+// ── ast-grep result parsing & ripgrep-shaped output ──────────
+
+#[derive(Debug, PartialEq)]
+struct AgMatch {
+    file: String,
+    line: u64,
+    text: String,
+}
+
+enum OutputMode {
+    /// `line_numbers` mirrors ripgrep: `file:line:text` with -n, `file:text`
+    /// without. Emitting the line field unconditionally broke the rg contract
+    /// for every caller that did not ask for it.
+    Content { line_numbers: bool },
+    /// `show_filename` mirrors ripgrep: a `path:count` line per file, except for
+    /// a single explicitly-named FILE, where rg prints a bare count.
+    Count { show_filename: bool },
+    FilesWithMatches,
+}
+
+/// Parse ast-grep's `--json=stream` output (one JSON object per line).
+fn parse_ag_matches(stdout: &str) -> Vec<AgMatch> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let v: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+            Some(AgMatch {
+                file: v.get("file").and_then(|f| f.as_str()).unwrap_or("").to_string(),
+                // ast-grep's range.start.line is 0-INDEXED; ripgrep reports
+                // 1-indexed lines. Printing it raw pointed every redirected hit
+                // one line above the real match.
+                line: v
+                    .get("range")
+                    .and_then(|r| r.get("start"))
+                    .and_then(|s| s.get("line"))
+                    .and_then(|l| l.as_u64())
+                    .unwrap_or(0)
+                    + 1,
+                text: v
+                    .get("lines")
+                    .and_then(|l| l.as_str())
+                    .or_else(|| v.get("text").and_then(|t| t.as_str()))
+                    .unwrap_or("")
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Render matches in ripgrep's output shape for the requested mode. Files are
+/// emitted in sorted order: ast-grep's parallel walk is nondeterministic, and a
+/// stable order is what makes the output diffable.
+fn render_output(matches: &[AgMatch], mode: OutputMode) -> String {
+    let mut out = String::new();
+    match mode {
+        OutputMode::Content { line_numbers } => {
+            for m in matches {
+                if line_numbers {
+                    out.push_str(&format!("{}:{}:{}\n", m.file, m.line, m.text));
+                } else {
+                    out.push_str(&format!("{}:{}\n", m.file, m.text));
+                }
+            }
+        }
+        OutputMode::Count { show_filename } => {
+            if show_filename {
+                let mut per_file: BTreeMap<&str, u64> = BTreeMap::new();
+                for m in matches {
+                    *per_file.entry(m.file.as_str()).or_insert(0) += 1;
+                }
+                for (file, count) in per_file {
+                    out.push_str(&format!("{file}:{count}\n"));
+                }
+            } else {
+                out.push_str(&format!("{}\n", matches.len()));
+            }
+        }
+        OutputMode::FilesWithMatches => {
+            let files: std::collections::BTreeSet<&str> =
+                matches.iter().map(|m| m.file.as_str()).collect();
+            for f in files {
+                out.push_str(&format!("{f}\n"));
+            }
+        }
+    }
+    out
+}
+
 // ── ast-grep runner ──────────────────────────────────────────
 
 fn run_ast_grep(sg_pattern: &str, lang: &str, path: &str, inv: &RgInvocation) -> u64 {
@@ -972,9 +1131,21 @@ fn run_ast_grep(sg_pattern: &str, lang: &str, path: &str, inv: &RgInvocation) ->
     let mut cmd = Command::new("ast-grep");
     cmd.arg("run")
         .arg("-p").arg(sg_pattern)
-        .arg("-l").arg(lang)
-        .arg(path)
-        .arg("--json=stream");
+        .arg("-l").arg(lang);
+    // Forward the caller's file filters — ast-grep's --globs takes the same
+    // gitignore-style syntax as rg's -g, `!` negation included.
+    for g in &inv.globs {
+        cmd.arg("--globs").arg(g);
+    }
+    // Search EVERY path the caller gave, not just the first.
+    if inv.paths.is_empty() {
+        cmd.arg(path);
+    } else {
+        for p in &inv.paths {
+            cmd.arg(p);
+        }
+    }
+    cmd.arg("--json=stream");
 
     let output = match cmd.output() {
         Ok(o) => o,
@@ -1002,48 +1173,25 @@ fn run_ast_grep(sg_pattern: &str, lang: &str, path: &str, inv: &RgInvocation) ->
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let matches: Vec<serde_json::Value> = stdout
-        .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            if trimmed.is_empty() { return None; }
-            serde_json::from_str(trimmed).ok()
-        })
-        .collect();
+    let matches = parse_ag_matches(&stdout);
 
     let count = matches.len() as u64;
-    let mut ag_unique_files = HashSet::new();
-    for m in &matches {
-        if let Some(f) = m.get("file").and_then(|f| f.as_str()) {
-            ag_unique_files.insert(f.to_string());
-        }
-    }
+    let ag_unique_files: HashSet<&str> = matches.iter().map(|m| m.file.as_str()).collect();
     let ag_file_count = ag_unique_files.len() as u64;
 
-    if inv.count {
-        println!("{}", count);
+    let mode = if inv.count {
+        // rg omits the path prefix only when exactly one FILE was named.
+        let single_file = inv.paths.len() == 1 && std::path::Path::new(&inv.paths[0]).is_file();
+        OutputMode::Count { show_filename: !single_file }
     } else if inv.files_with_matches {
-        let mut files: Vec<&str> = matches.iter()
-            .filter_map(|m| m.get("file").and_then(|f| f.as_str()))
-            .collect();
-        files.sort();
-        files.dedup();
-        for f in files { println!("{}", f); }
+        OutputMode::FilesWithMatches
     } else {
-        for m in &matches {
-            let file = m.get("file").and_then(|f| f.as_str()).unwrap_or("");
-            let start_line = m.get("range")
-                .and_then(|r| r.get("start"))
-                .and_then(|s| s.get("line"))
-                .and_then(|l| l.as_u64())
-                .unwrap_or(0);
-            let content = m.get("lines")
-                .and_then(|l| l.as_str())
-                .or_else(|| m.get("text").and_then(|t| t.as_str()))
-                .unwrap_or("");
-            println!("{}:{}:{}", file, start_line, content);
+        // Unset → ripgrep's own default: line numbers for a TTY, none when piped.
+        OutputMode::Content {
+            line_numbers: inv.line_numbers.unwrap_or_else(|| std::io::stdout().is_terminal()),
         }
-    }
+    };
+    print!("{}", render_output(&matches, mode));
 
     // Capture comparison data (rg vs ast-grep) for the report. Record the RAW
     // user pattern (what rg was counted against), not the translated ast-grep
@@ -1785,5 +1933,169 @@ mod tests {
     #[test]
     fn empty_counts_is_none() {
         assert_eq!(dominant_lang(&counts(&[])), None);
+    }
+
+    // ── flag fidelity: what ast-grep cannot express must pass through ──
+    //
+    // run_ast_grep honoured only -c/-l and silently dropped everything else, so a
+    // redirected search answered a DIFFERENT question than the one asked — most
+    // starkly `-v`, which returned the matching lines instead of the non-matching
+    // ones. A flag we cannot honour must send the whole call to real rg.
+
+    #[test]
+    fn invert_match_is_unsupported() {
+        assert_eq!(parse(&["-v", "deviceId", "src"]).unsupported.as_deref(), Some("-v"));
+        assert_eq!(parse(&["--invert-match", "deviceId"]).unsupported.as_deref(), Some("--invert-match"));
+    }
+
+    #[test]
+    fn context_flags_are_unsupported() {
+        assert_eq!(parse(&["-A2", "deviceId", "src"]).unsupported.as_deref(), Some("-A"));
+        assert_eq!(parse(&["-C", "2", "deviceId"]).unsupported.as_deref(), Some("-C"));
+        assert_eq!(parse(&["--context=2", "deviceId"]).unsupported.as_deref(), Some("--context"));
+    }
+
+    #[test]
+    fn case_insensitivity_is_unsupported_because_ast_grep_is_case_sensitive() {
+        assert_eq!(parse(&["-i", "deviceId", "src"]).unsupported.as_deref(), Some("-i"));
+        assert_eq!(parse(&["-S", "deviceId"]).unsupported.as_deref(), Some("-S"));
+    }
+
+    #[test]
+    fn max_count_and_only_matching_are_unsupported() {
+        assert_eq!(parse(&["-m1", "deviceId"]).unsupported.as_deref(), Some("-m"));
+        assert_eq!(parse(&["-o", "deviceId"]).unsupported.as_deref(), Some("-o"));
+    }
+
+    #[test]
+    fn unsupported_short_flag_inside_a_bundle_is_detected() {
+        // `-nv` bundles line-numbers with invert; the invert must still be caught.
+        assert_eq!(parse(&["-nv", "deviceId"]).unsupported.as_deref(), Some("-v"));
+    }
+
+    #[test]
+    fn ordinary_flags_are_not_marked_unsupported() {
+        assert_eq!(parse(&["-n", "-l", "--no-heading", "--color", "never", "deviceId", "src"]).unsupported, None);
+        assert_eq!(parse(&["-c", "--type", "ts", "deviceId"]).unsupported, None);
+    }
+
+    #[test]
+    fn a_flags_value_is_never_mistaken_for_a_flag() {
+        // `-e -v` means "search for the literal -v", not "invert".
+        let inv = parse(&["-e", "-v", "src"]);
+        assert_eq!(inv.pattern.as_deref(), Some("-v"));
+        assert_eq!(inv.unsupported, None);
+    }
+
+    #[test]
+    fn nothing_after_double_dash_counts_as_a_flag() {
+        let inv = parse(&["--", "-v", "src"]);
+        assert_eq!(inv.pattern.as_deref(), Some("-v"));
+        assert_eq!(inv.unsupported, None);
+    }
+
+    // ── flag fidelity: what ast-grep CAN express must be forwarded ──
+    //
+    // `ast-grep run` accepts multiple [PATHS] and a --globs flag with gitignore
+    // (`!`-negating) semantics, so these are forwarded rather than denied.
+
+    #[test]
+    fn every_positional_path_is_captured_not_just_the_first() {
+        let inv = parse(&["deviceId", "src", "other"]);
+        assert_eq!(inv.paths, vec!["src".to_string(), "other".to_string()]);
+        assert_eq!(inv.path, "src", "path stays the first path for language inference");
+    }
+
+    #[test]
+    fn stdin_dash_is_not_collected_as_a_path() {
+        assert_eq!(parse(&["deviceId", "-", "src"]).paths, vec!["src".to_string()]);
+    }
+
+    #[test]
+    fn globs_are_captured_for_forwarding() {
+        let inv = parse(&["-g", "*.ts", "--glob=!test/**", "deviceId", "src"]);
+        assert_eq!(inv.globs, vec!["*.ts".to_string(), "!test/**".to_string()]);
+        assert_eq!(inv.unsupported, None, "globs are forwarded, not a passthrough reason");
+        assert_eq!(inv.pattern.as_deref(), Some("deviceId"));
+    }
+
+    // ── output fidelity: line numbers and -c format must match ripgrep ──
+
+    fn ag_json(file: &str, line: u64, text: &str) -> String {
+        format!(
+            r#"{{"file":"{file}","range":{{"start":{{"line":{line}}}}},"lines":"{text}"}}"#
+        )
+    }
+
+    #[test]
+    fn ast_grep_line_zero_becomes_ripgrep_line_one() {
+        // ast-grep's JSON range.start.line is 0-indexed; ripgrep reports 1-indexed.
+        // Printing it raw pointed every redirected hit one line above the match.
+        let m = parse_ag_matches(&ag_json("src/a.ts", 0, "const deviceId = 1;"));
+        assert_eq!(m[0].line, 1);
+        assert_eq!(m[0].file, "src/a.ts");
+    }
+
+    #[test]
+    fn content_output_is_file_colon_line_colon_text() {
+        let m = parse_ag_matches(&ag_json("src/a.ts", 0, "const deviceId = 1;"));
+        assert_eq!(
+            render_output(&m, OutputMode::Content { line_numbers: true }),
+            "src/a.ts:1:const deviceId = 1;\n"
+        );
+    }
+
+    #[test]
+    fn content_output_omits_the_line_number_when_not_asked_for() {
+        // Piped `rg PATTERN src` prints `file:content` — no line field.
+        let m = parse_ag_matches(&ag_json("src/a.ts", 0, "const deviceId = 1;"));
+        assert_eq!(
+            render_output(&m, OutputMode::Content { line_numbers: false }),
+            "src/a.ts:const deviceId = 1;\n"
+        );
+    }
+
+    #[test]
+    fn line_number_preference_is_tracked() {
+        assert_eq!(parse(&["-n", "deviceId", "src"]).line_numbers, Some(true));
+        assert_eq!(parse(&["--line-number", "deviceId"]).line_numbers, Some(true));
+        assert_eq!(parse(&["-N", "deviceId"]).line_numbers, Some(false));
+        assert_eq!(parse(&["--no-line-number", "deviceId"]).line_numbers, Some(false));
+        // Unset → rg's own default applies (on for a TTY, off when piped).
+        assert_eq!(parse(&["deviceId", "src"]).line_numbers, None);
+    }
+
+    #[test]
+    fn count_output_is_per_file_like_ripgrep() {
+        let stdout = format!(
+            "{}\n{}\n{}",
+            ag_json("src/a.ts", 0, "a"),
+            ag_json("src/a.ts", 4, "b"),
+            ag_json("src/b.ts", 2, "c")
+        );
+        let m = parse_ag_matches(&stdout);
+        assert_eq!(
+            render_output(&m, OutputMode::Count { show_filename: true }),
+            "src/a.ts:2\nsrc/b.ts:1\n"
+        );
+    }
+
+    #[test]
+    fn count_output_omits_the_filename_for_a_single_explicit_file() {
+        // `rg -c PATTERN src/a.ts` prints a bare count, no path prefix.
+        let m = parse_ag_matches(&format!("{}\n{}", ag_json("src/a.ts", 0, "a"), ag_json("src/a.ts", 4, "b")));
+        assert_eq!(render_output(&m, OutputMode::Count { show_filename: false }), "2\n");
+    }
+
+    #[test]
+    fn files_with_matches_output_is_sorted_and_deduped() {
+        let stdout = format!(
+            "{}\n{}\n{}",
+            ag_json("src/b.ts", 0, "a"),
+            ag_json("src/a.ts", 0, "b"),
+            ag_json("src/b.ts", 3, "c")
+        );
+        let m = parse_ag_matches(&stdout);
+        assert_eq!(render_output(&m, OutputMode::FilesWithMatches), "src/a.ts\nsrc/b.ts\n");
     }
 }
