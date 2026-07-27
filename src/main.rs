@@ -786,21 +786,52 @@ fn ext_to_lang(ext: &str) -> Option<&'static str> {
 
 // ── Classification ───────────────────────────────────────────
 
+/// Reduce a pattern to its literal text when its only regex syntax is escaped
+/// punctuation, else None.
+///
+/// Agents escape parens (`store_mls_message\(`) because a bare `(` is an
+/// invalid regex for ripgrep — that is the CANONICAL shape of a call search,
+/// and rejecting it on the backslash threw away 29 real structural searches.
+/// `\` followed by a letter or digit is an assertion or class (`\b`, `\d`,
+/// `\w`, `\s`), which is real regex semantics, so the pattern is text.
+fn literal_form(pattern: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(n) if n.is_alphanumeric() => return None, // \b \d \w \s …
+                Some(n) => out.push(n),                        // escaped literal
+                None => return None,                           // dangling backslash
+            }
+        } else {
+            // Unescaped regex metacharacters mean a genuine text search.
+            // NOTE: `(`, `)` and `.` are deliberately absent — classify()
+            // treats them as structural indicators.
+            if matches!(c, '|' | '[' | ']' | '*' | '+' | '?' | '{' | '}' | '^' | '$') {
+                return None;
+            }
+            out.push(c);
+        }
+    }
+    Some(out)
+}
+
 fn classify(pattern: &str) -> bool {
-    // Regex patterns are never structural — pass through to rg
-    if pattern.contains('\\') {
+    // Escaped-literal patterns reduce to their literal text; anything carrying
+    // real regex semantics is a text search and passes through.
+    let literal = match literal_form(pattern) {
+        Some(l) => l,
+        None => return false,
+    };
+
+    // Path-like tokens are never structural. A '/' cannot appear in an
+    // identifier or call pattern in any supported language.
+    if literal.contains('/') {
         return false;
     }
 
-    // Path-like tokens (or regexes with slashes) are never structural. A '/'
-    // cannot appear in an identifier or call pattern in any supported language,
-    // but it does appear in every misparsed `rg --files <path>` invocation —
-    // and a dotted path (~/.claude/…) would otherwise classify as structural.
-    if pattern.contains('/') {
-        return false;
-    }
-
-    let raw = pattern.trim();
+    let raw = literal.trim();
 
     if raw.is_empty() || raw.len() <= 1 {
         return false;
@@ -1930,6 +1961,43 @@ mod tests {
         assert!(classify("useState("));
         assert!(classify("Command::new("));
         assert!(classify("verify_aud"));
+    }
+
+    // ── classify: escaped punctuation is a literal, not a regex ──
+    //
+    // Agents write `store_mls_message\(` because a bare `(` is an invalid
+    // regex for rg. classify() rejected every one of them on the backslash —
+    // 29 wrongly-rejected call searches in the live event log.
+
+    #[test]
+    fn escaped_paren_call_is_structural() {
+        assert!(classify(r"store_mls_message\("));
+        assert!(classify(r"bypass_rls\("));
+    }
+
+    #[test]
+    fn escaped_dot_is_structural() {
+        assert!(classify(r"app\.current_tenant_id"));
+    }
+
+    #[test]
+    fn regex_assertions_are_not_structural() {
+        // \b is a word boundary, not an escaped literal `b`.
+        assert!(!classify(r"\btext\("));
+        assert!(!classify(r"\d+"));
+    }
+
+    #[test]
+    fn escaped_alternation_is_still_a_regex() {
+        assert!(!classify(r"a\(|b\("));
+    }
+
+    #[test]
+    fn literal_form_unescapes_punctuation_only() {
+        assert_eq!(literal_form(r"store_mls_message\("), Some("store_mls_message(".into()));
+        assert_eq!(literal_form(r"\btext"), None, "word-boundary assertion");
+        assert_eq!(literal_form(r"a|b"), None, "unescaped alternation");
+        assert_eq!(literal_form(r"trailing\"), None, "dangling backslash");
     }
 
     // ── translate_pattern: definitions need a body in brace languages ──
