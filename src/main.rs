@@ -1,9 +1,18 @@
 // smart-rg: A drop-in rg replacement that redirects structural code searches
 // to ast-grep. Claude Code / Hermes / any coding agent compatible.
 //
-// Architecture:
-//   Input (rg flags) → Classify pattern → Structural? → ast-grep → Reformat → Output
-//                                       → Text?       → real rg  → Output
+// Architecture: ripgrep runs FIRST, as ground truth — it can never be silently
+// empty. ast-grep then FILTERS those hits down to the structural ones, once
+// per language actually present in the matched files.
+//
+//   Input (rg flags) → Classify pattern → Structural? → rg (captured, ground truth)
+//                                                          → ast-grep filters, per language
+//                                                          → Output (confirmed ∪ unsearched)
+//                                       → Text?          → real rg → Output
+//
+// A hit is kept when ast-grep confirmed it, OR when its file/language was
+// never actually searched (unmapped extension, or ast-grep found nothing at
+// all for that language — indistinguishable from a spawn/grammar failure).
 //
 // Stats:  smart-rg stats [--json]
 //         smart-rg report [-o path.html]
@@ -168,9 +177,21 @@ struct RgInvocation {
     // The first flag found whose SEMANTICS ast-grep cannot reproduce. Set → the
     // whole call must go to real rg (see UNSUPPORTED_LONG / unsupported_short).
     unsupported: Option<String>,
+    /// `--no-smart`: force plain ripgrep, no structural filtering.
+    no_smart: bool,
+    // Indices into the args slice of tokens that belong to the SHIM, not to
+    // ripgrep, and must never be forwarded. Recorded by the parser so the
+    // stripper cannot disagree with it about `--` or value-taking flags.
+    shim_flag_indices: Vec<usize>,
     // -n/--line-number → Some(true), -N/--no-line-number → Some(false), unset →
     // None, meaning rg's own default (on for a TTY, off when piped).
     line_numbers: Option<bool>,
+    // The argv for the internal `rg --json` capture run: the caller's tokens with
+    // output-mode flags removed (or rewritten, for bundles that also carry a
+    // filter) and shim-owned flags removed. Built during the SAME walk that
+    // parses everything else, so it cannot disagree with that parse about the
+    // `--` boundary or about which tokens are flag VALUES.
+    capture_argv: Vec<String>,
 }
 
 // Flags that change WHICH lines match, or the shape of the output, in a way
@@ -195,6 +216,9 @@ const UNSUPPORTED_LONG: &[&str] = &[
     "fixed-strings", "replace",
     // output shapes the shim does not emit
     "quiet", "json",
+    // vimgrep wants file:line:COLUMN:text (shim does not emit COLUMN)
+    // passthru wants every line; under --json those are context records that parse_rg_json discards
+    "vimgrep", "passthru",
 ];
 
 // Short forms of the same set. Case matters: `-c` (count) is supported,
@@ -227,18 +251,70 @@ fn short_takes_value(c: char) -> bool {
     matches!(c, 'e' | 't' | 'T' | 'g' | 'm' | 'A' | 'B' | 'C' | 'M' | 'j' | 'f' | 'r' | 'E' | 'd')
 }
 
+/// Remove tokens that belong to the shim rather than ripgrep.
+///
+/// Driven by indices the PARSER recorded, never by matching strings. A blind
+/// string filter disagrees with ripgrep's grammar in two ways that both
+/// corrupt the user's search: it deletes a literal `--no-smart` appearing
+/// after `--` (where ripgrep says everything is positional), and it deletes
+/// the token when it is the VALUE of a preceding flag such as `-e`.
+fn strip_shim_flags(args: &[String], shim_indices: &[usize]) -> Vec<String> {
+    args.iter()
+        .enumerate()
+        .filter(|(i, _)| !shim_indices.contains(i))
+        .map(|(_, a)| a.clone())
+        .collect()
+}
+
+// Long flags that select an OUTPUT MODE — the long-form counterpart of
+// `is_output_mode_short` below. These must never reach the internal `--json`
+// capture run: ripgrep's mode precedence lets them beat `--json` regardless of
+// position, so the capture would come back as plain text, fail to parse, and
+// look exactly like a genuine no-match.
+fn is_output_mode_long(name: &str) -> bool {
+    matches!(
+        name,
+        "count" | "count-matches" | "files-with-matches"
+            | "line-number" | "no-line-number"
+            | "heading" | "no-heading"
+            | "json"
+            // ripgrep's own top-level modes: these print plain text and exit 0,
+            // so surviving into the --json capture would yield a silent false
+            // empty. Such calls pass through upstream anyway; excluding them
+            // here means capture_argv does not depend on that gate.
+            | "files" | "type-list"
+    )
+}
+
 fn parse_rg_invocation(args: &[String]) -> RgInvocation {
     let mut inv = RgInvocation { path: ".".into(), ..Default::default() };
     let mut positionals: Vec<String> = Vec::new();
     let mut explicit_pattern: Option<String> = None;
+    // Every -e/--regexp AND -f/--file occurrence, counted unconditionally —
+    // including the ones `explicit_pattern.is_none()` below discards. ast-grep
+    // takes exactly one pattern; more than one SOURCE means the call is a
+    // union query (`-e A -e B` == `A|B`) that no single ast-grep pattern can
+    // express, so it must go to real rg whole (see the check after the loop).
+    let mut pattern_sources: u32 = 0;
     let mut i = 0;
 
     while i < args.len() {
+        // Snapshotted once per iteration so its two consumers can never
+        // disagree about which token this pass is about: the `--no-smart`
+        // arm below records it into shim_flag_indices, and is_shim reads
+        // that same push back to decide whether THIS token belongs in
+        // capture_argv. No test can catch a regression here directly
+        // (--no-smart is absent from LONG_VALUE_FLAGS, so the
+        // value-consuming `i += 1` never fires on that path) — the
+        // invariant is held by this comment, not by coverage.
+        let token_start = i;
         let a = &args[i];
 
         // Everything after `--` is positional, verbatim.
         if a == "--" {
             positionals.extend(args[i + 1..].iter().cloned());
+            inv.capture_argv.push("--".to_string());
+            inv.capture_argv.extend(args[i + 1..].iter().cloned());
             break;
         }
 
@@ -251,23 +327,52 @@ fn parse_rg_invocation(args: &[String]) -> RgInvocation {
             };
             let full = format!("--{name}");
             let mut value: Option<String> = inline_val;
+            let mut consumed_next = false;
             if value.is_none() && LONG_VALUE_FLAGS.contains(&full.as_str()) && i + 1 < args.len() {
                 value = Some(args[i + 1].clone());
+                consumed_next = true;
                 i += 1; // consume the value token
             }
             if UNSUPPORTED_LONG.contains(&name) && inv.unsupported.is_none() {
                 inv.unsupported = Some(full.clone());
             }
             match name {
-                "regexp" | "file" => { if explicit_pattern.is_none() { explicit_pattern = value; } }
-                "type" => { if value.is_some() { inv.file_type = value; } }
-                "glob" => { if let Some(v) = value { inv.globs.push(v); } }
+                "regexp" | "file" => {
+                    pattern_sources += 1;
+                    // --file's argument is a FILE OF PATTERNS, not a pattern — the
+                    // parser stores the filename in explicit_pattern, and every
+                    // downstream consumer (classify, translate_pattern, ast-grep
+                    // itself) would filter against that filename as if the user
+                    // had typed it. Unconditional: even the FIRST --file must not
+                    // redirect.
+                    if name == "file" && inv.unsupported.is_none() {
+                        inv.unsupported = Some("-f".to_string());
+                    }
+                    if explicit_pattern.is_none() { explicit_pattern = value.clone(); }
+                }
+                "type" => { if value.is_some() { inv.file_type = value.clone(); } }
+                "glob" => { if let Some(v) = &value { inv.globs.push(v.clone()); } }
                 "count" => inv.count = true,
                 "files-with-matches" => inv.files_with_matches = true,
                 "files" | "type-list" => inv.pattern_less = true,
                 "line-number" => inv.line_numbers = Some(true),
                 "no-line-number" => inv.line_numbers = Some(false),
+                "no-smart" => {
+                    inv.no_smart = true;
+                    inv.shim_flag_indices.push(token_start);
+                }
                 _ => {}
+            }
+            // Capture argv: keep the token unless it is an output-mode flag (it
+            // would beat --json in ripgrep's own mode precedence) or a shim-owned
+            // flag. Shim ownership is read back from the index the match arm just
+            // recorded, so there is ONE encoding of that fact, not two.
+            let is_shim = inv.shim_flag_indices.last() == Some(&token_start);
+            if !is_output_mode_long(name) && !is_shim {
+                inv.capture_argv.push(a.clone());
+                if consumed_next {
+                    inv.capture_argv.push(value.clone().unwrap());
+                }
             }
             i += 1;
             continue;
@@ -303,7 +408,15 @@ fn parse_rg_invocation(args: &[String]) -> RgInvocation {
                         String::new()
                     };
                     match c {
-                        'e' | 'f' => { if explicit_pattern.is_none() { explicit_pattern = Some(value); } }
+                        'e' | 'f' => {
+                            pattern_sources += 1;
+                            // Same rule as --file above: -f's value is a file OF
+                            // patterns, not a pattern.
+                            if c == 'f' && inv.unsupported.is_none() {
+                                inv.unsupported = Some("-f".to_string());
+                            }
+                            if explicit_pattern.is_none() { explicit_pattern = Some(value); }
+                        }
                         't' => inv.file_type = Some(value),
                         'g' => inv.globs.push(value),
                         _ => {}
@@ -312,6 +425,15 @@ fn parse_rg_invocation(args: &[String]) -> RgInvocation {
                 }
                 idx += 1;
             }
+            // Capture argv: rewrite drops only output-mode chars, never a
+            // value-taking char, so whenever a value was consumed the flag
+            // itself survives the rewrite — push the value verbatim, unexamined.
+            if let Some(rewritten) = rewrite_short_token(a) {
+                inv.capture_argv.push(rewritten);
+                if consumed_next {
+                    inv.capture_argv.push(args[i + 1].clone());
+                }
+            }
             if consumed_next { i += 1; }
             i += 1;
             continue;
@@ -319,7 +441,18 @@ fn parse_rg_invocation(args: &[String]) -> RgInvocation {
 
         // Positional (pattern or path).
         positionals.push(a.clone());
+        inv.capture_argv.push(a.clone());
         i += 1;
+    }
+
+    // More than one pattern SOURCE (`-e A -e B`, or any mix with -f/--file):
+    // rg answers the union of all of them, but ast-grep only ever gets the
+    // ONE pattern kept above, so filtering the union against a single
+    // pattern silently drops every real hit the other sources produced. A -f
+    // occurrence already forced passthrough above (unconditionally, even
+    // alone); this additionally catches `-e A -e B` (no -f involved).
+    if pattern_sources > 1 && inv.unsupported.is_none() {
+        inv.unsupported = Some("-e (multiple patterns)".to_string());
     }
 
     // ripgrep semantics: with -e/-f the pattern is explicit and ALL positionals
@@ -495,10 +628,14 @@ fn main() {
     // replaces the clap-derive struct that had to enumerate rg's whole flag surface.
     let inv = parse_rg_invocation(&args[1..]);
 
+    // `--no-smart` is ours; ripgrep would reject it. Every passthrough below
+    // forwards `rg_args`, never the raw argv.
+    let rg_args = strip_shim_flags(&args[1..], &inv.shim_flag_indices);
+
     let pattern = match inv.pattern.as_ref() {
         Some(p) => p.clone(),
         // No search term (e.g. `--files`, `--version`, `--type-list`): forward as-is.
-        None => exec_real_rg(&args[1..]),
+        None => exec_real_rg(&rg_args),
     };
 
     // Stream-filter guard: `cmd | rg PATTERN` reads stdin, which ast-grep cannot
@@ -509,7 +646,7 @@ fn main() {
     if inv.reads_stdin || is_stream_filter(inv.has_path, std::io::stdin().is_terminal()) {
         let reason = if inv.reads_stdin { "stdin_dash" } else { "stream_stdin" };
         log_event("passthrough", &pattern, reason, None, 0);
-        exec_real_rg(&args[1..]);
+        exec_real_rg(&rg_args);
     }
 
     // Flag-fidelity guard: a flag whose semantics ast-grep cannot reproduce
@@ -518,39 +655,122 @@ fn main() {
     // answer is right; the lost redirect is only a lost optimisation.
     if let Some(flag) = inv.unsupported.clone() {
         log_event("passthrough", &pattern, &format!("unsupported_flag_{flag}"), None, 0);
-        exec_real_rg(&args[1..]);
+        exec_real_rg(&rg_args);
     }
 
-    let lang_from_type = map_lang(&inv.file_type);
-    let is_structural = classify(&pattern);
-
-    // If no --type flag, try to infer language from the search path's file extensions.
-    let lang = lang_from_type.or_else(|| infer_lang_from_path(&inv.path));
-
-    if !is_structural || lang.is_none() {
-        let reason = if !is_structural { "not_structural" } else { "no_language" };
-        log_event("passthrough", &pattern, reason, lang, 0);
-        exec_real_rg(&args[1..]);
+    if inv.no_smart {
+        log_event("passthrough", &pattern, "no_smart", None, 0);
+        exec_real_rg(&rg_args);
     }
 
-    let lang = lang.unwrap();
+    if !classify(&pattern) {
+        log_event("passthrough", &pattern, "not_structural", None, 0);
+        exec_real_rg(&rg_args);
+    }
+
+    // ① ripgrep first: ground truth, and it can never be silently empty.
+    let rg_start = Instant::now();
+    let hits = match run_rg_capture(&inv.capture_argv) {
+        RgCapture::Failed => {
+            log_event("passthrough", &pattern, "rg_failed", None, 0);
+            exec_real_rg(&rg_args);
+        }
+        RgCapture::Unparseable => {
+            log_event("passthrough", &pattern, "rg_json_unparseable", None, 0);
+            exec_real_rg(&rg_args);
+        }
+        RgCapture::OverCap(hits) => {
+            // rg already ran — render what we have. Re-running it would
+            // reintroduce the double-execution this design removes.
+            log_event("fallback", &pattern, "over_cap", None, hits.len() as u64);
+            print!("{}", render_output(&hits, output_mode(&inv)));
+            std::process::exit(0);
+        }
+        RgCapture::Matches(hits) => hits,
+    };
+    let rg_time_ms = rg_start.elapsed().as_millis() as u64;
+
+    // ② Nothing to filter — ast-grep never spawns.
+    if hits.is_empty() {
+        log_event("no_match", &pattern, "rg_empty", None, 0);
+        std::process::exit(1);
+    }
+
+    // ③ ast-grep filters, once per language actually present in the hits.
+    let mut files: Vec<String> = hits.iter().map(|h| h.file.clone()).collect();
+    files.sort();
+    files.dedup(); // rg emits one record per matching LINE, not per file
+    let by_lang = group_files_by_lang(&files);
+
+    if by_lang.is_empty() {
+        // No hit file has a language ast-grep can parse. Nothing to filter.
+        log_event("fallback", &pattern, "no_searchable_language", None, hits.len() as u64);
+        print!("{}", render_output(&hits, output_mode(&inv)));
+        std::process::exit(0);
+    }
+
     let sg_pattern = translate_pattern(&pattern);
 
-    eprintln!("\x1b[36m🔀 smart-rg → ast-grep ({})  pattern: '{}'\x1b[0m", lang, sg_pattern);
+    let ag_start = Instant::now();
+    // LANGUAGE granularity: this catches a whole language confirming nothing
+    // (wrong grammar / spawn failure — indistinguishable, see
+    // confirm_by_language). A file ast-grep silently skips WITHIN an otherwise
+    // confirming language is not caught here and stays suppressed.
+    let (ag, searched, confirming_langs) =
+        confirm_by_language(&by_lang, |lang, files| run_ast_grep_on_files(&sg_pattern, lang, files));
+    let ag_time_ms = ag_start.elapsed().as_millis() as u64;
+    // Only languages that actually confirmed something are credited. Labelling
+    // a run "css,html,python" for a single Python confirmation would corrupt
+    // the Top-languages KPI, which groups on this string verbatim.
+    let lang_label = confirming_langs.join(",");
 
-    let match_count = run_ast_grep(&sg_pattern, lang, &inv.path, &inv);
+    let out = filter_matches(&hits, &ag, &searched);
 
-    // run_ast_grep already handled genuine errors (non-empty stderr -> exec real
-    // rg before returning), so here a clean run with 0 matches means ast-grep
-    // found nothing — commonly a wrong-language guess over a polyglot tree. Fall
-    // back to real rg so the user gets real hits instead of a silent empty.
-    // Logged as `fallback`, never a structural win, so the noise-avoided metric
-    // stays honest.
-    if match_count == 0 {
-        log_event("fallback", &pattern, "ast_grep_empty", Some(lang), 0);
-        exec_real_rg(&args[1..]);
+    // ④ ast-grep confirmed nothing in the files it searched — show every
+    // ripgrep hit rather than an empty answer, and do NOT credit a win.
+    if out.confirmed_hits == 0 {
+        log_event("fallback", &pattern, "ast_grep_empty", Some(&lang_label), hits.len() as u64);
+        print!("{}", render_output(&hits, output_mode(&inv)));
+        std::process::exit(0);
     }
-    log_event("structural", &sg_pattern, "redirected", Some(lang), match_count);
+    // lang_label is non-empty from here on: out.confirmed_hits > 0 requires at
+    // least one language in confirming_langs, since that is the only way
+    // filter_matches counts a confirmation.
+
+    if out.suppressed > 0 {
+        eprintln!(
+            "\x1b[36msmart-rg: {} match{} not confirmed as structural by ast-grep \
+             — rerun with --no-smart\x1b[0m",
+            out.suppressed,
+            if out.suppressed == 1 { "" } else { "es" }
+        );
+    }
+    print!("{}", render_output(&out.kept, output_mode(&inv)));
+
+    let searched_files: HashSet<&str> = hits
+        .iter()
+        .map(|h| norm_path(h.file.as_str()))
+        .filter(|f| searched.contains(*f))
+        .collect();
+    // Files ast-grep CONFIRMED at least one hit in. Must be a subset of the
+    // searched files, or the report claims ast-grep searched more files than
+    // ripgrep did — the inverse of this tool's premise. Deriving it from
+    // `searched` also revives `files_saved`, which was pinned at 0 while both
+    // counts measured the same set.
+    let confirmed_files: HashSet<&str> = out
+        .kept
+        .iter()
+        .map(|h| norm_path(h.file.as_str()))
+        .filter(|f| searched.contains(*f))
+        .collect();
+    log_event("structural", &sg_pattern, "filtered", Some(&lang_label), out.confirmed_hits as u64);
+    // Comparison covers SEARCHED files only: counting hits ast-grep never saw
+    // would manufacture fake "noise avoided".
+    log_comparison(
+        &pattern, &lang_label,
+        out.confirmed_hits as u64, confirmed_files.len() as u64, ag_time_ms,
+        out.searched_hits as u64, searched_files.len() as u64, rg_time_ms,
+    );
 }
 
 // ── Real rg executor ─────────────────────────────────────────
@@ -683,83 +903,6 @@ fn prune_old_events(conn: &Connection, days: u64) -> usize {
 
 // ── Language mapping ─────────────────────────────────────────
 
-fn map_lang(file_type: &Option<String>) -> Option<&str> {
-    match file_type.as_deref() {
-        Some("ts") | Some("typescript") => Some("typescript"),
-        Some("tsx") => Some("tsx"),
-        Some("js") | Some("javascript") => Some("javascript"),
-        Some("jsx") => Some("jsx"),
-        Some("py") | Some("python") => Some("python"),
-        Some("rs") | Some("rust") => Some("rust"),
-        Some("go") | Some("golang") => Some("go"),
-        Some("rb") | Some("ruby") => Some("ruby"),
-        Some("java") => Some("java"),
-        Some("c") | Some("cpp") | Some("c++") => Some("c"),
-        Some("css") => Some("css"),
-        Some("html") => Some("html"),
-        Some("swift") => Some("swift"),
-        Some("kt") | Some("kotlin") => Some("kotlin"),
-        Some("scala") => Some("scala"),
-        Some("php") => Some("php"),
-        Some("sql") => Some("sql"),
-        Some("sh") | Some("bash") | Some("shell") => Some("bash"),
-        _ => None,
-    }
-}
-
-// Infer the dominant language by counting file extensions under a path.
-// Only called when no --type flag was passed; returns None if path isn't a dir
-// or has no recognizable source files. Capped at a shallow scan (max_depth=2)
-// so it never blocks on large trees.
-fn infer_lang_from_path(path: &str) -> Option<&'static str> {
-    use std::collections::HashMap;
-    let base = std::path::Path::new(path);
-    if !base.is_dir() {
-        // Single file — detect from extension directly.
-        return ext_to_lang(base.extension()?.to_str()?);
-    }
-
-    let mut counts: HashMap<&'static str, usize> = HashMap::new();
-    // Walk up to depth 2 to keep this cheap.
-    walk_for_lang(base, 0, &mut counts);
-
-    dominant_lang(&counts)
-}
-
-// Choose the dominant language from extension counts. Two rules beyond "most
-// frequent wins": (1) a real programming language always beats markup/style
-// (html/css) — a stray `report.html` next to `main.rs` must not flip a Rust dir
-// to HTML; (2) ties resolve alphabetically so the result is deterministic (a
-// HashMap's iteration order is not).
-fn dominant_lang(counts: &std::collections::HashMap<&'static str, usize>) -> Option<&'static str> {
-    const MARKUP: &[&str] = &["html", "css"];
-    // Within a group, pick the highest count; break ties by the alphabetically
-    // smaller name (then.cmp reversed) so the choice is deterministic.
-    let best = |markup_group: bool| -> Option<&'static str> {
-        counts.iter()
-            .filter(|(lang, _)| MARKUP.contains(lang) == markup_group)
-            .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
-            .map(|(lang, _)| *lang)
-    };
-    // Programming languages first; fall back to markup only if none present.
-    best(false).or_else(|| best(true))
-}
-
-fn walk_for_lang(dir: &std::path::Path, depth: u32, counts: &mut std::collections::HashMap<&'static str, usize>) {
-    if depth > 2 { return; }
-    let rd = match std::fs::read_dir(dir) { Ok(r) => r, Err(_) => return };
-    for entry in rd.flatten() {
-        let p = entry.path();
-        if p.is_dir() {
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.starts_with('.') || name == "node_modules" || name == "target" { continue; }
-            walk_for_lang(&p, depth + 1, counts);
-        } else if let Some(lang) = p.extension().and_then(|e| e.to_str()).and_then(ext_to_lang) {
-            *counts.entry(lang).or_insert(0) += 1;
-        }
-    }
-}
-
 fn ext_to_lang(ext: &str) -> Option<&'static str> {
     match ext {
         "ts" => Some("typescript"),
@@ -784,23 +927,75 @@ fn ext_to_lang(ext: &str) -> Option<&'static str> {
     }
 }
 
+/// Group the files ripgrep actually matched by language.
+///
+/// This replaces inferring ONE dominant language from a filesystem walk. On a
+/// polyglot repo that guess is usually wrong: the live event log shows
+/// `arming_snapshot` attempted as python, javascript and typescript — eleven
+/// empty runs for one symbol. The files that matched cannot be wrong about
+/// their own extension. BTreeMap keeps the ast-grep spawn order deterministic.
+fn group_files_by_lang(files: &[String]) -> BTreeMap<&'static str, Vec<String>> {
+    let mut groups: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+    for f in files {
+        let ext = std::path::Path::new(f)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        if let Some(lang) = ext_to_lang(ext) {
+            groups.entry(lang).or_default().push(f.clone());
+        }
+    }
+    groups
+}
+
 // ── Classification ───────────────────────────────────────────
 
+/// Reduce a pattern to its literal text when its only regex syntax is escaped
+/// punctuation, else None.
+///
+/// Agents escape parens (`store_mls_message\(`) because a bare `(` is an
+/// invalid regex for ripgrep — that is the CANONICAL shape of a call search,
+/// and rejecting it on the backslash threw away 29 real structural searches.
+/// `\` followed by a letter or digit is an assertion or class (`\b`, `\d`,
+/// `\w`, `\s`), which is real regex semantics, so the pattern is text.
+fn literal_form(pattern: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(n) if n.is_alphanumeric() => return None, // \b \d \w \s …
+                Some(n) => out.push(n),                        // escaped literal
+                None => return None,                           // dangling backslash
+            }
+        } else {
+            // Unescaped regex metacharacters mean a genuine text search.
+            // NOTE: `(`, `)` and `.` are deliberately absent — classify()
+            // treats them as structural indicators.
+            if matches!(c, '|' | '[' | ']' | '*' | '+' | '?' | '{' | '}' | '^' | '$') {
+                return None;
+            }
+            out.push(c);
+        }
+    }
+    Some(out)
+}
+
 fn classify(pattern: &str) -> bool {
-    // Regex patterns are never structural — pass through to rg
-    if pattern.contains('\\') {
+    // Escaped-literal patterns reduce to their literal text; anything carrying
+    // real regex semantics is a text search and passes through.
+    let literal = match literal_form(pattern) {
+        Some(l) => l,
+        None => return false,
+    };
+
+    // Path-like tokens are never structural. A '/' cannot appear in an
+    // identifier or call pattern in any supported language.
+    if literal.contains('/') {
         return false;
     }
 
-    // Path-like tokens (or regexes with slashes) are never structural. A '/'
-    // cannot appear in an identifier or call pattern in any supported language,
-    // but it does appear in every misparsed `rg --files <path>` invocation —
-    // and a dotted path (~/.claude/…) would otherwise classify as structural.
-    if pattern.contains('/') {
-        return false;
-    }
-
-    let raw = pattern.trim();
+    let raw = literal.trim();
 
     if raw.is_empty() || raw.len() <= 1 {
         return false;
@@ -809,7 +1004,19 @@ fn classify(pattern: &str) -> bool {
     // Structural indicators
     let has_mixed_case = raw.chars().any(|c| c.is_uppercase()) && raw.chars().any(|c| c.is_lowercase());
     let has_snake = raw.contains('_');
-    let has_structural = raw.contains('.') || raw.contains("::")
+    // A dot signals structure (`obj.method`, `app.current_tenant_id`) only when it
+    // sits BETWEEN identifier characters. A leading or trailing dot is a dotfile or
+    // extension literal (`\.env`, `\.gitignore`) — a text search. Escaping used to
+    // make these safe by accident, before literal_form existed.
+    let chars: Vec<char> = raw.chars().collect();
+    let has_interior_dot = chars.iter().enumerate().any(|(i, &c)| {
+        c == '.'
+            && i > 0
+            && i + 1 < chars.len()
+            && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_')
+            && (chars[i + 1].is_alphanumeric() || chars[i + 1] == '_')
+    });
+    let has_structural = has_interior_dot || raw.contains("::")
         || raw.contains("->") || raw.contains('(') || raw.contains(')');
     let has_space = raw.contains(' ');
 
@@ -879,118 +1086,6 @@ fn translate_pattern(pattern: &str) -> String {
     pattern.to_string()
 }
 
-// ── run_rg_count (for comparison baseline using --count) ────
-/// Runs real rg --count on the ORIGINAL user CLI args (replay) to get
-/// accurate (total_matches, file_count) for ROI savings vs AST results.
-fn run_rg_count(original_args: &[String], search_path: &str) -> (u64, u64) {
-    // Resolve the real ripgrep safely (never the shim — see real_rg_path).
-    // If we can't find it, skip the baseline rather than risk a re-exec loop.
-    let rg = match real_rg_path() {
-        Some(p) => p,
-        None => return (0, 0),
-    };
-
-    let mut cmd = Command::new(&rg);
-    // --count-matches, NOT --count: ast-grep's figure is a count of matched AST
-    // NODES (occurrences), while `--count` reports the number of matching LINES.
-    // Comparing the two measured different things — two occurrences on one line
-    // scored rg=1 against ag=2, producing "impossible" rows where the text tool
-    // appears to find LESS than the structural one and systematically
-    // understating the noise ast-grep avoided.
-    //
-    // -F (literal): the intercepted pattern is often a structural form like `foo(`
-    // that is an INVALID regex for ripgrep. Without -F the baseline silently errors
-    // to 0 results and the reported savings collapse for exactly the paren-style
-    // patterns the shim is built to redirect.
-    cmd.arg("--count-matches").arg("-F");
-    let mut i = 0;
-    let args_slice = original_args;
-    while i < args_slice.len() {
-        let arg = &args_slice[i];
-        // Skip output-mode flags that conflict with --count
-        if matches!(arg.as_str(), "-c" | "--count" | "--count-matches" | "-l" | "--files-with-matches"
-            | "--files" | "--files-without-match" | "-o" | "--only-matching") {
-            i += 1;
-            continue;
-        }
-        // Translate --type to -g globs for EVERY language map_lang accepts. We
-        // glob uniformly rather than pass some type names through, because rg's
-        // type vocabulary doesn't match ast-grep's: rg has no `tsx`/`jsx` type and
-        // names Rust/Ruby `rust`/`ruby`, so `--type rs` etc. would error and zero
-        // the baseline. Globs always work; unknown types fall through unchanged.
-        if arg == "--type" || arg == "-t" {
-            if i + 1 < args_slice.len() {
-                let globs: &[&str] = match args_slice[i + 1].as_str() {
-                    "ts" | "typescript" => &["*.ts"],
-                    "tsx" => &["*.tsx"],
-                    "js" | "javascript" => &["*.js"],
-                    "jsx" => &["*.jsx"],
-                    "py" | "python" => &["*.py"],
-                    "rs" | "rust" => &["*.rs"],
-                    "rb" | "ruby" => &["*.rb"],
-                    "go" | "golang" => &["*.go"],
-                    "java" => &["*.java"],
-                    "c" => &["*.c", "*.h"],
-                    "cpp" | "c++" => &["*.cpp", "*.cc", "*.cxx", "*.hpp", "*.hh"],
-                    "css" => &["*.css"],
-                    "html" => &["*.html"],
-                    "swift" => &["*.swift"],
-                    "kt" | "kotlin" => &["*.kt"],
-                    "scala" => &["*.scala"],
-                    "php" => &["*.php"],
-                    "sql" => &["*.sql"],
-                    "sh" | "bash" | "shell" => &["*.sh"],
-                    _ => &[],
-                };
-                if !globs.is_empty() {
-                    for g in globs {
-                        cmd.arg("-g").arg(g);
-                    }
-                    i += 2;
-                    continue;
-                }
-            }
-        }
-        cmd.arg(arg);
-        i += 1;
-    }
-    // Append the search path only if the replayed args don't already carry it.
-    // ripgrep does NOT dedupe path arguments, so passing it twice double-counts
-    // every file and inflates the reported savings. When the user passed no path,
-    // search_path is "." (clap's default) and is absent from the args, so we add it.
-    if !args_slice.iter().any(|a| a == search_path) {
-        cmd.arg(search_path);
-    }
-
-    let output = match cmd.stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-    {
-        Ok(o) => o,
-        Err(_) => return (0, 0),
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut total_matches = 0u64;
-    let mut file_count = 0u64;
-    for line in stdout.lines() {
-        let t = line.trim();
-        if t.is_empty() { continue; }
-        if let Some(colon) = t.rfind(':') {
-            let (p, cpart) = t.split_at(colon);
-            if !p.is_empty() {
-                if let Ok(cnt) = cpart[1..].trim().parse::<u64>() {
-                    if cnt > 0 {
-                        total_matches += cnt;
-                        file_count += 1;
-                    }
-                }
-            }
-        }
-    }
-    (total_matches, file_count)
-}
-
 // ── log_comparison (inserts into comparisons with ROI fields + rate limit) ─
 fn log_comparison(
     pattern: &str,
@@ -1041,10 +1136,182 @@ fn log_comparison(
 
 // ── ast-grep result parsing & ripgrep-shaped output ──────────
 
+/// One matching line as ripgrep reported it. Distinct from `AgMatch`: this is a
+/// LINE ripgrep hit, whereas an `AgMatch` is a syntax NODE ast-grep confirmed.
+#[derive(Debug, PartialEq, Clone)]
+struct RgMatch {
+    file: String,
+    line: u64,
+    text: String,
+}
+
+/// Parse ripgrep's `--json` event stream, returning the matches and a count of
+/// lines that could NOT be parsed: either not valid JSON at all, or a `match`
+/// record whose fields could not be extracted.
+///
+/// `--json` is used rather than `path:line:text` because a path may itself
+/// contain a colon. ripgrep emits `lines.bytes` (base64) instead of
+/// `lines.text` when a matching line is not valid UTF-8, and `path.bytes` for
+/// non-UTF-8 filenames. Those records carry a real hit we cannot represent.
+/// Since this capture IS the user's answer, dropping them silently loses
+/// search results — so the count is returned and the caller refuses to filter
+/// when it is non-zero.
+fn parse_rg_json(stdout: &str) -> (Vec<RgMatch>, usize) {
+    let mut matches = Vec::new();
+    let mut unparseable = 0usize;
+    for line in stdout.lines() {
+        let v: serde_json::Value = match serde_json::from_str(line.trim()) {
+            Ok(v) => v,
+            // A line ripgrep emitted that we cannot even parse as JSON is
+            // exactly the case this return value exists to catch: it may hold
+            // a real match we cannot represent, so it must be counted, not
+            // silently skipped.
+            Err(_) => {
+                unparseable += 1;
+                continue;
+            }
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("match") {
+            continue;
+        }
+        let parsed = (|| -> Option<RgMatch> {
+            let d = v.get("data")?;
+            Some(RgMatch {
+                file: d.get("path")?.get("text")?.as_str()?.to_string(),
+                line: d.get("line_number")?.as_u64()?,
+                // ripgrep includes the trailing line terminator (\n on Unix, \r\n
+                // on Windows). Strip both so rendering controls line breaks.
+                text: d.get("lines")?.get("text")?.as_str()?
+                    .trim_end_matches('\n')
+                    .trim_end_matches('\r')
+                    .to_string(),
+            })
+        })();
+        match parsed {
+            Some(m) => matches.push(m),
+            None => unparseable += 1,
+        }
+    }
+    (matches, unparseable)
+}
+
+/// Above this many matches, stop filtering and render ripgrep's output as-is.
+/// The shim already buffers ast-grep's JSON, so capturing is not new in kind —
+/// but ripgrep matches more, so it is new in degree.
+const MATCH_CAP: usize = 10_000;
+
+enum RgCapture {
+    /// Within the cap — eligible for structural filtering.
+    Matches(Vec<RgMatch>),
+    /// Too many to filter; render as-is. Note we still hold the matches:
+    /// re-running ripgrep would reintroduce the double-run this design removes.
+    OverCap(Vec<RgMatch>),
+    /// ripgrep could not be run, or failed. Caller should passthrough.
+    Failed,
+    /// At least one `match` record could not be parsed, so the capture is not
+    /// ground truth and must not be used to filter.
+    Unparseable,
+}
+
+/// Short flags that select an OUTPUT MODE. These must never reach the internal
+/// `--json` run: ripgrep's mode precedence lets `-c`/`-l` beat `--json` no
+/// matter where it sits in the argv, so the capture would come back as plain
+/// text, parse to zero matches, and look exactly like a genuine no-match.
+fn is_output_mode_short(c: char) -> bool {
+    matches!(c, 'c' | 'l' | 'n' | 'N')
+}
+
+/// Rewrite a short-flag token for the internal `--json` capture run, dropping
+/// only the OUTPUT-MODE characters and keeping everything else.
+///
+/// Returns None when nothing survives (the token was purely output modes).
+///
+/// A bundle can legitimately mix modes with filters: `-cg` is count + glob,
+/// `-ntrust` is line-numbers + `--type rust`, `-ce` is count + the pattern flag.
+/// Dropping the whole token loses the filter — or, when the value sits in the
+/// NEXT argv token, strands it as a bare positional and silently changes
+/// ripgrep's pattern/path assignment. Scanning STOPS at the first value-taking
+/// char, because everything after it belongs to that flag's value and must be
+/// copied verbatim (`-tcpp` must never become `-tpp`).
+fn rewrite_short_token(token: &str) -> Option<String> {
+    let chars: Vec<char> = token.chars().skip(1).collect();
+    let mut kept = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if short_takes_value(c) {
+            // This flag and the rest of the token (its value) are copied as-is.
+            kept.extend(&chars[i..]);
+            break;
+        }
+        if !is_output_mode_short(c) {
+            kept.push(c);
+        }
+        i += 1;
+    }
+    if kept.is_empty() {
+        None
+    } else {
+        Some(format!("-{kept}"))
+    }
+}
+
+/// Prepend `--json` to the capture argv the parser produced.
+///
+/// The argv itself is built by `parse_rg_invocation` during its own walk, so it
+/// agrees with that parse about the `--` boundary and about which tokens are
+/// flag VALUES. Re-deriving those roles from string shape here produced four
+/// separate silent-wrong-search bugs before this was moved.
+fn capture_command_args(capture_argv: &[String]) -> Vec<String> {
+    let mut out = vec!["--json".to_string()];
+    out.extend(capture_argv.iter().cloned());
+    out
+}
+
+/// Run the real ripgrep and capture its matches. ripgrep exits 1 on "no
+/// matches", which is a normal empty result, not a failure — only a spawn
+/// failure or an exit code above 1 is treated as `Failed`.
+fn run_rg_capture(capture_argv: &[String]) -> RgCapture {
+    // PRECONDITION: only valid once main() has established that this call has a
+    // pattern and carries no unsupported flag. ripgrep's own top-level modes
+    // (--files, --type-list, -h, --generate) print plain text and exit 0, which
+    // would parse to a silent false empty. main()'s pattern-None and --help
+    // early returns are what exclude them; they must stay ahead of this call.
+    debug_assert!(!capture_argv.is_empty(), "capture argv must carry a pattern");
+    let rg = match real_rg_path() {
+        Some(p) => p,
+        None => return RgCapture::Failed,
+    };
+    let output = match Command::new(&rg)
+        .args(capture_command_args(capture_argv))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return RgCapture::Failed,
+    };
+    if output.status.code().unwrap_or(2) > 1 {
+        return RgCapture::Failed;
+    }
+    let (matches, unparseable) = parse_rg_json(&String::from_utf8_lossy(&output.stdout));
+    if unparseable > 0 {
+        return RgCapture::Unparseable;
+    }
+    if matches.len() > MATCH_CAP {
+        RgCapture::OverCap(matches)
+    } else {
+        RgCapture::Matches(matches)
+    }
+}
+
 #[derive(Debug, PartialEq)]
 struct AgMatch {
     file: String,
     line: u64,
+    /// Last line of the node (1-based, inclusive). A node may span several
+    /// lines; see `is_confirmed`.
+    end_line: u64,
     text: String,
 }
 
@@ -1081,6 +1348,13 @@ fn parse_ag_matches(stdout: &str) -> Vec<AgMatch> {
                     .and_then(|l| l.as_u64())
                     .unwrap_or(0)
                     + 1,
+                end_line: v
+                    .get("range")
+                    .and_then(|r| r.get("end"))
+                    .and_then(|e| e.get("line"))
+                    .and_then(|l| l.as_u64())
+                    .unwrap_or(0)
+                    + 1,
                 text: v
                     .get("lines")
                     .and_then(|l| l.as_str())
@@ -1092,10 +1366,154 @@ fn parse_ag_matches(stdout: &str) -> Vec<AgMatch> {
         .collect()
 }
 
+/// Normalise a path string for cross-tool comparison.
+///
+/// ripgrep echoes the caller's path verbatim (`./src/a.ts`) while ast-grep
+/// strips a leading `./` (`src/a.ts`). Keying the span map on raw strings
+/// therefore misses on EVERY file whenever the caller passes a `./`-prefixed
+/// path — Claude Code's canonical call shape — silently disabling filtering.
+fn norm_path(p: &str) -> &str {
+    let mut s = p;
+    while let Some(rest) = s.strip_prefix("./") {
+        s = rest;
+    }
+    s
+}
+
+/// Line spans (1-based, inclusive) ast-grep confirmed, keyed by file.
+fn confirmed_spans(matches: &[AgMatch]) -> HashMap<&str, Vec<(u64, u64)>> {
+    let mut spans: HashMap<&str, Vec<(u64, u64)>> = HashMap::new();
+    for m in matches {
+        spans.entry(norm_path(m.file.as_str())).or_default().push((m.line, m.end_line));
+    }
+    spans
+}
+
+/// Is this ripgrep hit inside a node ast-grep confirmed?
+///
+/// CONTAINMENT, not equality. ripgrep reports every matching line; ast-grep
+/// reports one span per node. Comparing against the node's start line alone
+/// silently drops hits on continuation lines of a multi-line call.
+fn is_confirmed(hit: &RgMatch, spans: &HashMap<&str, Vec<(u64, u64)>>) -> bool {
+    spans
+        .get(norm_path(hit.file.as_str()))
+        .is_some_and(|v| v.iter().any(|&(start, end)| hit.line >= start && hit.line <= end))
+}
+
+/// What survived filtering, plus the counts the telemetry needs.
+struct FilterOutcome {
+    /// Hits to print.
+    kept: Vec<RgMatch>,
+    /// Searched-but-unconfirmed hits (comments, strings, SQL) that were hidden.
+    suppressed: usize,
+    /// Hits in files ast-grep actually searched — the honest comparison denominator.
+    searched_hits: usize,
+    /// Of those, how many ast-grep confirmed.
+    confirmed_hits: usize,
+}
+
+/// Split ripgrep's hits into what to print and what was hidden.
+///
+/// A hit is kept when ast-grep confirmed it, OR when its file was never searched
+/// at all. `group_files_by_lang` drops any extension it cannot map (`.sql`,
+/// `.md`, `.json`, and case-mismatched `.TS`), so those files reach ast-grep
+/// never and can produce no confirmations. Suppressing them would silently
+/// delete real results — `rg tenant_id src/` would print the `db.py` hits and
+/// swallow every `schema.sql` one.
+///
+/// `searched` holds NORMALISED paths (`norm_path`), because ripgrep reports
+/// `./db.py` where ast-grep reports `db.py`.
+fn filter_matches(hits: &[RgMatch], ag: &[AgMatch], searched: &HashSet<String>) -> FilterOutcome {
+    let spans = confirmed_spans(ag);
+    let mut kept = Vec::new();
+    let mut suppressed = 0usize;
+    let mut searched_hits = 0usize;
+    let mut confirmed_hits = 0usize;
+    for h in hits {
+        let was_searched = searched.contains(norm_path(h.file.as_str()));
+        if !was_searched {
+            kept.push(h.clone());
+            continue;
+        }
+        searched_hits += 1;
+        if is_confirmed(h, &spans) {
+            confirmed_hits += 1;
+            kept.push(h.clone());
+        } else {
+            suppressed += 1;
+        }
+    }
+    FilterOutcome { kept, suppressed, searched_hits, confirmed_hits }
+}
+
+/// Run ast-grep over an EXPLICIT file list rather than a directory.
+///
+/// Two wins over walking a directory: ast-grep and ripgrep can no longer
+/// disagree about ignore rules, and the language is known to be right because it
+/// came from these files' own extensions. Errors yield no matches; the caller
+/// then shows ripgrep's hits, so a failure is never silent.
+fn run_ast_grep_on_files(sg_pattern: &str, lang: &str, files: &[String]) -> Vec<AgMatch> {
+    let mut cmd = Command::new("ast-grep");
+    cmd.arg("run").arg("-p").arg(sg_pattern).arg("-l").arg(lang);
+    for f in files {
+        cmd.arg(f);
+    }
+    cmd.arg("--json=stream");
+    match cmd.output() {
+        Ok(o) => parse_ag_matches(&String::from_utf8_lossy(&o.stdout)),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Run ast-grep once per language and report which files were genuinely
+/// searched, i.e. belong to a language that confirmed at least one match.
+///
+/// A language that confirms nothing is treated as NOT SEARCHED, because a
+/// wrong-grammar run exits 1 with no output and NO stderr — indistinguishable
+/// from a genuine empty. Its files' hits are then kept rather than suppressed.
+/// The runner is injected so this decision is testable without spawning
+/// ast-grep; `main()` passes `run_ast_grep_on_files`.
+fn confirm_by_language<F>(
+    by_lang: &BTreeMap<&'static str, Vec<String>>,
+    mut run: F,
+) -> (Vec<AgMatch>, HashSet<String>, Vec<&'static str>)
+where
+    F: FnMut(&str, &[String]) -> Vec<AgMatch>,
+{
+    let mut ag = Vec::new();
+    let mut searched = HashSet::new();
+    let mut confirming = Vec::new();
+    for (lang, files) in by_lang {
+        let found = run(lang, files);
+        if found.is_empty() {
+            continue;
+        }
+        searched.extend(files.iter().map(|f| norm_path(f.as_str()).to_string()));
+        confirming.push(*lang);
+        ag.extend(found);
+    }
+    (ag, searched, confirming)
+}
+
+/// The output shape the caller asked for.
+fn output_mode(inv: &RgInvocation) -> OutputMode {
+    if inv.count {
+        // rg omits the path prefix only when exactly one FILE was named.
+        let single_file = inv.paths.len() == 1 && std::path::Path::new(&inv.paths[0]).is_file();
+        OutputMode::Count { show_filename: !single_file }
+    } else if inv.files_with_matches {
+        OutputMode::FilesWithMatches
+    } else {
+        OutputMode::Content {
+            line_numbers: inv.line_numbers.unwrap_or_else(|| std::io::stdout().is_terminal()),
+        }
+    }
+}
+
 /// Render matches in ripgrep's output shape for the requested mode. Files are
 /// emitted in sorted order: ast-grep's parallel walk is nondeterministic, and a
 /// stable order is what makes the output diffable.
-fn render_output(matches: &[AgMatch], mode: OutputMode) -> String {
+fn render_output(matches: &[RgMatch], mode: OutputMode) -> String {
     let mut out = String::new();
     match mode {
         OutputMode::Content { line_numbers } => {
@@ -1131,97 +1549,6 @@ fn render_output(matches: &[AgMatch], mode: OutputMode) -> String {
     out
 }
 
-// ── ast-grep runner ──────────────────────────────────────────
-
-fn run_ast_grep(sg_pattern: &str, lang: &str, path: &str, inv: &RgInvocation) -> u64 {
-    let ag_start = std::time::Instant::now();
-    let mut cmd = Command::new("ast-grep");
-    cmd.arg("run")
-        .arg("-p").arg(sg_pattern)
-        .arg("-l").arg(lang);
-    // Forward the caller's file filters — ast-grep's --globs takes the same
-    // gitignore-style syntax as rg's -g, `!` negation included.
-    for g in &inv.globs {
-        cmd.arg("--globs").arg(g);
-    }
-    // Search EVERY path the caller gave, not just the first.
-    if inv.paths.is_empty() {
-        cmd.arg(path);
-    } else {
-        for p in &inv.paths {
-            cmd.arg(p);
-        }
-    }
-    cmd.arg("--json=stream");
-
-    let output = match cmd.output() {
-        Ok(o) => o,
-        Err(_) => {
-            log_event("ast_grep_error", sg_pattern, "spawn_failed", Some(lang), 0);
-            let args: Vec<String> = std::env::args().skip(1).collect();
-            exec_real_rg(&args);
-        }
-    };
-    let ag_time_ms = ag_start.elapsed().as_millis() as u64;
-
-    if !output.status.success() {
-        // ast-grep exits 1 on "no matches" — that is the normal empty-result case,
-        // not a failure, and it writes nothing to stderr. A genuine failure (bad
-        // path, unreadable file/stream, internal error) writes to stderr. Only the
-        // latter is a real error: log it AND fall back to real rg so the user still
-        // gets results instead of a silent empty answer.
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.trim().is_empty() {
-            log_event("ast_grep_error", sg_pattern,
-                &format!("exit_{}_stderr_{}", output.status, stderr.trim()), Some(lang), 0);
-            let args: Vec<String> = std::env::args().skip(1).collect();
-            exec_real_rg(&args);
-        }
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let matches = parse_ag_matches(&stdout);
-
-    let count = matches.len() as u64;
-    let ag_unique_files: HashSet<&str> = matches.iter().map(|m| m.file.as_str()).collect();
-    let ag_file_count = ag_unique_files.len() as u64;
-
-    let mode = if inv.count {
-        // rg omits the path prefix only when exactly one FILE was named.
-        let single_file = inv.paths.len() == 1 && std::path::Path::new(&inv.paths[0]).is_file();
-        OutputMode::Count { show_filename: !single_file }
-    } else if inv.files_with_matches {
-        OutputMode::FilesWithMatches
-    } else {
-        // Unset → ripgrep's own default: line numbers for a TTY, none when piped.
-        OutputMode::Content {
-            line_numbers: inv.line_numbers.unwrap_or_else(|| std::io::stdout().is_terminal()),
-        }
-    };
-    print!("{}", render_output(&matches, mode));
-
-    // Capture comparison data (rg vs ast-grep) for the report. Record the RAW
-    // user pattern (what rg was counted against), not the translated ast-grep
-    // form, so the report's Pattern column matches the numbers beside it.
-    //
-    // Only credit savings when ast-grep actually won (count > 0). On a 0-match
-    // redirect main now falls back to real rg and SHOWS those results, so
-    // crediting "noise avoided" for them would be false. (Supersedes the earlier
-    // v0.3.6 "log every redirect incl. count==0" choice — see issue #12.)
-    if count > 0 {
-        let raw_pattern = inv.pattern.as_deref().unwrap_or(sg_pattern);
-        let rg_start = Instant::now();
-        let (rg_results, rg_file_count) = run_rg_count(&std::env::args().skip(1).collect::<Vec<_>>(), path);
-        let rg_time_ms = rg_start.elapsed().as_millis() as u64;
-        log_comparison(raw_pattern, lang, count, ag_file_count, ag_time_ms, rg_results, rg_file_count, rg_time_ms);
-    }
-
-    if matches.is_empty() {
-        return 0;
-    }
-    count
-}
-
 // ══════════════════════════════════════════════════════════════
 //  STATS (from SQLite)
 // ══════════════════════════════════════════════════════════════
@@ -1232,6 +1559,11 @@ struct StatsReport {
     structural: u64,
     passthrough: u64,
     errors: u64,
+    /// rg found nothing at all — ast-grep never ran. Neither a win nor a
+    /// failure; excluded from `redirect_rate`'s denominator (see
+    /// `redirect_rate()`) so a batch of pure no-match searches can't drag the
+    /// rate down for a change that had nothing to do with them.
+    no_match: u64,
     redirect_rate: f64,
     total_matches_found: u64,
     // Primary headline metric: false-positive matches a naive text search would
@@ -1287,6 +1619,9 @@ struct DayStats {
     day: String,
     total: u64,
     structural: u64,
+    // Its own column, not folded into "total - structural" ("Text"): rg found
+    // nothing, so there is no text/AST question to render for that search.
+    no_match: u64,
 }
 
 #[derive(serde::Serialize)]
@@ -1367,6 +1702,104 @@ fn comparison_totals(conn: &Connection) -> ComparisonTotals {
 /// whole table regardless; this only bounds the rendered rows.
 const COMPARISON_PAGE: usize = 50;
 
+/// Structural redirects as a fraction of searches that had something TO
+/// redirect. `no_match` (rg found nothing; ast-grep never ran) is neither a
+/// win nor a failure, so it must not sit in this denominator — leaving it in
+/// distorts the rate toward zero for searches the change never touched.
+fn redirect_rate(total: u64, structural: u64, no_match: u64) -> f64 {
+    let denom = total.saturating_sub(no_match);
+    if denom > 0 { structural as f64 / denom as f64 * 100.0 } else { 0.0 }
+}
+
+/// By-language counts for structural redirects. `lang` may be a comma-joined
+/// list of every CONFIRMING language in one event (a genuinely polyglot
+/// confirmation — see `lang_label` in main()), so each row is split on ','
+/// and fanned out before accumulating: a "python,typescript" row credits
+/// BOTH "python" and "typescript", instead of becoming its own bucket
+/// distinct from either.
+fn language_counts(conn: &Connection) -> HashMap<String, u64> {
+    let mut counts = HashMap::new();
+    let stmt = conn.prepare(
+        "SELECT lang, COUNT(*) FROM events WHERE event='structural' AND lang != '' GROUP BY lang"
+    ).ok();
+    if let Some(mut s) = stmt {
+        let rows = s.query_map([], |row| {
+            let l: String = row.get(0)?;
+            let c: u64 = row.get(1)?;
+            Ok((l, c))
+        }).ok();
+        if let Some(rows) = rows {
+            for (lang, cnt) in rows.flatten() {
+                for single in lang.split(',').filter(|s| !s.is_empty()) {
+                    *counts.entry(single.to_string()).or_insert(0) += cnt;
+                }
+            }
+        }
+    }
+    counts
+}
+
+/// Top redirected patterns, same comma-split fan-out as `language_counts` —
+/// otherwise a pattern that sometimes confirms alone and sometimes confirms
+/// alongside another language fragments across two (pattern, lang) buckets
+/// instead of one count per language it actually touched.
+fn top_pattern_stats(conn: &Connection) -> Vec<PatternStat> {
+    let mut merged: HashMap<(String, String), u64> = HashMap::new();
+    let stmt = conn.prepare(
+        "SELECT pattern, lang, COUNT(*) as cnt FROM events WHERE event='structural' GROUP BY pattern, lang"
+    ).ok();
+    if let Some(mut s) = stmt {
+        let rows = s.query_map([], |row| {
+            let p: String = row.get(0)?;
+            let l: String = row.get(1)?;
+            let c: u64 = row.get(2)?;
+            Ok((p, l, c))
+        }).ok();
+        if let Some(rows) = rows {
+            for (pattern, lang, cnt) in rows.flatten() {
+                for single in lang.split(',').filter(|s| !s.is_empty()) {
+                    *merged.entry((pattern.clone(), single.to_string())).or_insert(0) += cnt;
+                }
+            }
+        }
+    }
+    let mut top: Vec<PatternStat> = merged
+        .into_iter()
+        .map(|((pattern, lang), count)| PatternStat { pattern, lang, count })
+        .collect();
+    top.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.pattern.cmp(&b.pattern)));
+    top.truncate(10);
+    top
+}
+
+/// Per-day totals, formatted date not epoch. `no_match` is its own column —
+/// see DayStats — so the time chart can give it its own series instead of
+/// folding it into "Text".
+fn day_counts(conn: &Connection) -> Vec<DayStats> {
+    let mut by_day = Vec::new();
+    let stmt = conn.prepare(
+        "SELECT date(substr(ts, 1, 10), 'unixepoch') as day,
+                COUNT(*) as total,
+                COUNT(CASE WHEN event='structural' THEN 1 END) as structural,
+                COUNT(CASE WHEN event='no_match' THEN 1 END) as no_match
+         FROM events GROUP BY day ORDER BY day"
+    ).ok();
+    if let Some(mut s) = stmt {
+        let rows = s.query_map([], |row| {
+            Ok(DayStats {
+                day: row.get(0)?,
+                total: row.get(1)?,
+                structural: row.get(2)?,
+                no_match: row.get(3)?,
+            })
+        }).ok();
+        if let Some(rows) = rows {
+            for r in rows.flatten() { by_day.push(r); }
+        }
+    }
+    by_day
+}
+
 fn compute_stats() -> StatsReport {
     let conn = match open_db() {
         Some(c) => c,
@@ -1407,7 +1840,11 @@ fn compute_stats() -> StatsReport {
         [], |r| r.get(0)
     ).unwrap_or(0);
 
-    let redirect_rate = if total > 0 { structural as f64 / total as f64 * 100.0 } else { 0.0 };
+    let no_match: u64 = conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE event='no_match'", [], |r| r.get(0)
+    ).unwrap_or(0);
+
+    let rate = redirect_rate(total, structural, no_match);
 
     let total_matches: u64 = conn.query_row(
         "SELECT COALESCE(SUM(matches), 0) FROM events WHERE event='structural'",
@@ -1450,60 +1887,15 @@ fn compute_stats() -> StatsReport {
         }
     }
 
-    // By language (structural only)
-    let mut by_language = HashMap::new();
-    let stmt = conn.prepare(
-        "SELECT lang, COUNT(*) FROM events WHERE event='structural' AND lang != '' GROUP BY lang ORDER BY COUNT(*) DESC"
-    ).ok();
-    if let Some(mut s) = stmt {
-        let rows = s.query_map([], |row| {
-            let l: String = row.get(0)?;
-            let c: u64 = row.get(1)?;
-            Ok((l, c))
-        }).ok();
-        if let Some(rows) = rows {
-            for r in rows.flatten() { by_language.insert(r.0, r.1); }
-        }
-    }
+    // By language (structural only) — see language_counts for why the raw
+    // comma-joined `lang` column is split before aggregating.
+    let by_language = language_counts(&conn);
 
     // By day (formatted date, not epoch)
-    let mut by_day = Vec::new();
-    let stmt = conn.prepare(
-        "SELECT date(substr(ts, 1, 10), 'unixepoch') as day,
-                COUNT(*) as total,
-                COUNT(CASE WHEN event='structural' THEN 1 END) as structural
-         FROM events GROUP BY day ORDER BY day"
-    ).ok();
-    if let Some(mut s) = stmt {
-        let rows = s.query_map([], |row| {
-            Ok(DayStats {
-                day: row.get(0)?,
-                total: row.get(1)?,
-                structural: row.get(2)?,
-            })
-        }).ok();
-        if let Some(rows) = rows {
-            for r in rows.flatten() { by_day.push(r); }
-        }
-    }
+    let by_day = day_counts(&conn);
 
-    // Top patterns
-    let mut top_patterns = Vec::new();
-    let stmt = conn.prepare(
-        "SELECT pattern, lang, COUNT(*) as cnt FROM events WHERE event='structural' GROUP BY pattern, lang ORDER BY cnt DESC LIMIT 10"
-    ).ok();
-    if let Some(mut s) = stmt {
-        let rows = s.query_map([], |row| {
-            Ok(PatternStat {
-                pattern: row.get(0)?,
-                lang: row.get(1)?,
-                count: row.get(2)?,
-            })
-        }).ok();
-        if let Some(rows) = rows {
-            for r in rows.flatten() { top_patterns.push(r); }
-        }
-    }
+    // Top patterns — see top_pattern_stats for the same comma-split fan-out.
+    let top_patterns = top_pattern_stats(&conn);
 
     // Recent redirects (with formatted timestamp)
     let mut recent = Vec::new();
@@ -1576,7 +1968,8 @@ fn compute_stats() -> StatsReport {
         structural,
         passthrough,
         errors,
-        redirect_rate,
+        no_match,
+        redirect_rate: rate,
         total_matches_found: total_matches,
         total_false_positives_avoided: totals.false_positives,
         total_files_saved: totals.files_saved,
@@ -1596,7 +1989,7 @@ fn compute_stats() -> StatsReport {
 
 fn empty_stats() -> StatsReport {
     StatsReport {
-        total_intercepted: 0, structural: 0, passthrough: 0, errors: 0,
+        total_intercepted: 0, structural: 0, passthrough: 0, errors: 0, no_match: 0,
         redirect_rate: 0.0, total_matches_found: 0,
         total_false_positives_avoided: 0,
         total_files_saved: 0, total_tokens_saved_estimate: 0, total_cost_saved_cents: 0.0,
@@ -1622,8 +2015,9 @@ fn print_stats_table() {
     println!("\x1b[1m  Overview\x1b[0m");
     println!("  ─────────────────────────────────────────");
     println!("  Total intercepted:    {:>6}", stats.total_intercepted);
-    println!("  Structural redirects: {:>6}  ({:.1}%)", stats.structural, stats.redirect_rate);
+    println!("  Structural redirects: {:>6}  ({:.1}% of searches with something to redirect)", stats.structural, stats.redirect_rate);
     println!("  Passed through (text):{:>6}", stats.passthrough);
+    println!("  No match (rg empty):  {:>6}", stats.no_match);
     println!("  Errors/fallbacks:     {:>6}", stats.errors);
     println!("  Total matches found:  {:>6}", stats.total_matches_found);
     println!();
@@ -1754,6 +2148,10 @@ mod tests {
     fn parse(tokens: &[&str]) -> RgInvocation {
         let owned: Vec<String> = tokens.iter().map(|s| s.to_string()).collect();
         parse_rg_invocation(&owned)
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
@@ -1932,6 +2330,63 @@ mod tests {
         assert!(classify("verify_aud"));
     }
 
+    // ── classify: escaped punctuation is a literal, not a regex ──
+    //
+    // Agents write `store_mls_message\(` because a bare `(` is an invalid
+    // regex for rg. classify() rejected every one of them on the backslash —
+    // 29 wrongly-rejected call searches in the live event log.
+
+    #[test]
+    fn escaped_paren_call_is_structural() {
+        assert!(classify(r"store_mls_message\("));
+        assert!(classify(r"bypass_rls\("));
+    }
+
+    #[test]
+    fn escaped_dot_is_structural() {
+        assert!(classify(r"app\.current_tenant_id"));
+    }
+
+    #[test]
+    fn a_leading_dot_literal_is_not_structural() {
+        // `rg '\.env'` is a dotfile/extension text search. Escaping used to make
+        // this safe by accident; the dot heuristic must now reject it explicitly.
+        assert!(!classify(r"\.env"));
+        assert!(!classify(r"\.gitignore"));
+        assert!(!classify(r"\.log"));
+    }
+
+    #[test]
+    fn a_trailing_dot_literal_is_not_structural() {
+        assert!(!classify(r"env\."));
+    }
+
+    #[test]
+    fn an_interior_dot_is_still_structural() {
+        assert!(classify(r"app\.current_tenant_id"));
+        assert!(classify("app.current_tenant_id"));
+    }
+
+    #[test]
+    fn regex_assertions_are_not_structural() {
+        // \b is a word boundary, not an escaped literal `b`.
+        assert!(!classify(r"\btext\("));
+        assert!(!classify(r"\d+"));
+    }
+
+    #[test]
+    fn escaped_alternation_is_still_a_regex() {
+        assert!(!classify(r"a\(|b\("));
+    }
+
+    #[test]
+    fn literal_form_unescapes_punctuation_only() {
+        assert_eq!(literal_form(r"store_mls_message\("), Some("store_mls_message(".into()));
+        assert_eq!(literal_form(r"\btext"), None, "word-boundary assertion");
+        assert_eq!(literal_form(r"a|b"), None, "unescaped alternation");
+        assert_eq!(literal_form(r"trailing\"), None, "dangling backslash");
+    }
+
     // ── translate_pattern: definitions need a body in brace languages ──
 
     // A definition translates to the bare `keyword name` signature — NOT a
@@ -1975,37 +2430,6 @@ mod tests {
     fn call_to_thing_named_func_is_not_a_definition() {
         // `func(` with no name after the keyword is a CALL, not a definition.
         assert_eq!(translate_pattern("func("), "func($$$)");
-    }
-
-    // ── dominant_lang: programming beats markup, ties deterministic ──
-
-    fn counts(pairs: &[(&'static str, usize)]) -> std::collections::HashMap<&'static str, usize> {
-        pairs.iter().cloned().collect()
-    }
-
-    #[test]
-    fn programming_language_beats_markup() {
-        assert_eq!(dominant_lang(&counts(&[("rust", 1), ("html", 1)])), Some("rust"));
-    }
-
-    #[test]
-    fn markup_used_only_when_no_programming_language_present() {
-        assert_eq!(dominant_lang(&counts(&[("html", 2), ("css", 1)])), Some("html"));
-    }
-
-    #[test]
-    fn highest_count_wins_among_programming_languages() {
-        assert_eq!(dominant_lang(&counts(&[("rust", 3), ("python", 1)])), Some("rust"));
-    }
-
-    #[test]
-    fn ties_break_alphabetically_for_determinism() {
-        assert_eq!(dominant_lang(&counts(&[("go", 2), ("rust", 2)])), Some("go"));
-    }
-
-    #[test]
-    fn empty_counts_is_none() {
-        assert_eq!(dominant_lang(&counts(&[])), None);
     }
 
     // ── flag fidelity: what ast-grep cannot express must pass through ──
@@ -2067,6 +2491,52 @@ mod tests {
         assert_eq!(inv.unsupported, None);
     }
 
+    // ── flag fidelity: a call with more than one pattern SOURCE must pass
+    // through, not be filtered against only the first ──
+    //
+    // `explicit_pattern` keeps exactly one -e/--regexp and discards the rest,
+    // which used to be harmless (the kept pattern only decided WHETHER to
+    // redirect; a wrong guess fell through to real rg). Once capture_argv
+    // started forwarding EVERY pattern token to the rg capture, rg started
+    // answering the UNION query while filter_matches kept suppressing
+    // everything that didn't match the ONE retained pattern — silently
+    // deleting real hits. -f/--file has the same defect from a different
+    // angle: its argument is a FILE OF PATTERNS, not a pattern, so the
+    // parser was filtering against the patterns file's own NAME.
+
+    #[test]
+    fn multiple_patterns_force_passthrough() {
+        // rg answers the UNION of every -e; ast-grep takes one pattern, so it
+        // would filter against only the first and delete the rest's real hits.
+        assert!(parse(&["-e", "alphaCall\\(", "-e", "betaCall\\(", "f.py"]).unsupported.is_some());
+        assert!(parse(&["--regexp", "a", "--regexp", "b", "f.py"]).unsupported.is_some());
+    }
+
+    #[test]
+    fn a_single_pattern_still_redirects() {
+        assert_eq!(parse(&["-e", "alphaCall\\(", "f.py"]).unsupported, None);
+    }
+
+    #[test]
+    fn a_patterns_file_forces_passthrough() {
+        // -f's argument is a file OF patterns. The parser stored the FILENAME as
+        // the pattern, so the shim filtered against "queries.txt" itself.
+        assert!(parse(&["-f", "queries.txt", "b.js"]).unsupported.is_some());
+        assert!(parse(&["--file", "queries.txt", "b.js"]).unsupported.is_some());
+    }
+
+    #[test]
+    fn a_patterns_file_still_consumes_its_value() {
+        // Regression guard: `-f` must stay in short_takes_value. If it did not,
+        // `queries.txt` would fall through as a positional and become the
+        // PATTERN, and `b.js` would be the only path — which is exactly the
+        // silent-wrong-search this fix exists to prevent. The path is written
+        // BEFORE the flag so the assertion actually distinguishes the two
+        // parses; with the path last, both readings yield paths == ["b.js"].
+        let inv = parse(&["b.js", "-f", "queries.txt"]);
+        assert_eq!(inv.paths, strs(&["b.js"]), "queries.txt is -f's value, not a path");
+    }
+
     // ── flag fidelity: what ast-grep CAN express must be forwarded ──
     //
     // `ast-grep run` accepts multiple [PATHS] and a --globs flag with gitignore
@@ -2095,9 +2565,78 @@ mod tests {
     // ── output fidelity: line numbers and -c format must match ripgrep ──
 
     fn ag_json(file: &str, line: u64, text: &str) -> String {
+        ag_json_span(file, line, line, text)
+    }
+
+    fn ag_json_span(file: &str, start: u64, end: u64, text: &str) -> String {
         format!(
-            r#"{{"file":"{file}","range":{{"start":{{"line":{line}}}}},"lines":"{text}"}}"#
+            r#"{{"file":"{file}","range":{{"start":{{"line":{start}}},"end":{{"line":{end}}}}},"lines":"{text}"}}"#
         )
+    }
+
+    // ── containment, not equality ──
+    //
+    // A structural node can span several lines while ripgrep reports each
+    // matching line separately:
+    //
+    //   result = bypass_rls(        <- rg hits; ast-grep node STARTS here
+    //       session, tenant_id      <- rg ALSO hits here for `tenant_id`
+    //   )
+    //
+    // Confirming on the start line alone silently drops the second hit — the
+    // same silent-drop shape as v0.3.9, v0.3.10 and v0.3.12.
+
+    #[test]
+    fn a_dot_slash_rg_path_matches_ast_greps_normalised_path() {
+        // rg reports "./src/a.ts"; ast-grep reports "src/a.ts" for the same file.
+        // Raw-string keying missed on every file for the `./src` call shape.
+        let ag = parse_ag_matches(&ag_json("src/a.ts", 0, "const deviceId = 1;"));
+        let spans = confirmed_spans(&ag);
+        let hit = RgMatch {
+            file: "./src/a.ts".into(),
+            line: 1,
+            text: "const deviceId = 1;".into(),
+        };
+        assert!(is_confirmed(&hit, &spans), "leading ./ must not defeat the lookup");
+    }
+
+    #[test]
+    fn norm_path_strips_repeated_leading_dot_slash() {
+        assert_eq!(norm_path("./src/a.ts"), "src/a.ts");
+        assert_eq!(norm_path("././src/a.ts"), "src/a.ts");
+        assert_eq!(norm_path("src/a.ts"), "src/a.ts");
+        assert_eq!(norm_path("/abs/src/a.ts"), "/abs/src/a.ts");
+    }
+
+    #[test]
+    fn ast_grep_end_line_is_normalised_to_one_based() {
+        let m = parse_ag_matches(&ag_json_span("a.py", 0, 2, "bypass_rls("));
+        assert_eq!(m[0].line, 1);
+        assert_eq!(m[0].end_line, 3);
+    }
+
+    #[test]
+    fn a_hit_on_a_continuation_line_is_confirmed() {
+        let ag = parse_ag_matches(&ag_json_span("a.py", 0, 2, "bypass_rls("));
+        let spans = confirmed_spans(&ag);
+        let hit = RgMatch { file: "a.py".into(), line: 2, text: "  session, tenant_id".into() };
+        assert!(is_confirmed(&hit, &spans), "line 2 is inside the node span 1..=3");
+    }
+
+    #[test]
+    fn a_hit_outside_every_span_is_dropped() {
+        let ag = parse_ag_matches(&ag_json_span("a.py", 0, 2, "bypass_rls("));
+        let spans = confirmed_spans(&ag);
+        let hit = RgMatch { file: "a.py".into(), line: 9, text: "# bypass_rls in a comment".into() };
+        assert!(!is_confirmed(&hit, &spans));
+    }
+
+    #[test]
+    fn a_hit_in_an_unconfirmed_file_is_dropped() {
+        let ag = parse_ag_matches(&ag_json_span("a.py", 0, 2, "bypass_rls("));
+        let spans = confirmed_spans(&ag);
+        let hit = RgMatch { file: "other.sql".into(), line: 1, text: "-- bypass_rls".into() };
+        assert!(!is_confirmed(&hit, &spans));
     }
 
     #[test]
@@ -2109,9 +2648,134 @@ mod tests {
         assert_eq!(m[0].file, "src/a.ts");
     }
 
+    // ── filter_matches: rg is ground truth, ast-grep filters it ──
+
+    fn rg_hit(file: &str, line: u64, text: &str) -> RgMatch {
+        RgMatch { file: file.into(), line, text: text.into() }
+    }
+
+    fn searched_set(files: &[&str]) -> HashSet<String> {
+        files.iter().map(|f| norm_path(f).to_string()).collect()
+    }
+
+    // ── never filter a file ast-grep did not search ──
+    //
+    // group_files_by_lang drops any extension it cannot map (.sql, .md, .json,
+    // and case-mismatched .TS). Those files never reach ast-grep, so they can
+    // produce no confirmations. Suppressing them would silently delete real
+    // results — the failure class behind v0.3.9, v0.3.10 and v0.3.12.
+
+    #[test]
+    fn hits_in_an_unsearched_file_are_never_suppressed() {
+        let hits = vec![
+            rg_hit("db.py", 1, "bypass_rls(conn)"),
+            rg_hit("db.py", 7, "# bypass_rls in a comment"),
+            rg_hit("schema.sql", 3, "-- bypass_rls policy"),
+        ];
+        let ag = parse_ag_matches(&ag_json("db.py", 0, "bypass_rls(conn)"));
+        let searched = searched_set(&["db.py"]); // schema.sql has no ast-grep language
+        let out = filter_matches(&hits, &ag, &searched);
+        assert_eq!(
+            out.kept,
+            vec![rg_hit("db.py", 1, "bypass_rls(conn)"), rg_hit("schema.sql", 3, "-- bypass_rls policy")],
+            "the SQL hit must survive: ast-grep never looked at that file"
+        );
+        assert_eq!(out.suppressed, 1, "only the searched-but-unconfirmed comment");
+    }
+
+    #[test]
+    fn filter_keeps_confirmed_hits_and_counts_the_rest() {
+        let hits = vec![
+            rg_hit("a.py", 1, "bypass_rls(conn)"),
+            rg_hit("a.py", 7, "# bypass_rls is used above"),
+            rg_hit("a.py", 9, "SQL = 'select bypass_rls'"),
+        ];
+        let ag = parse_ag_matches(&ag_json("a.py", 0, "bypass_rls(conn)"));
+        let out = filter_matches(&hits, &ag, &searched_set(&["a.py"]));
+        assert_eq!(out.kept, vec![rg_hit("a.py", 1, "bypass_rls(conn)")]);
+        assert_eq!(out.suppressed, 2, "the comment and the SQL string");
+    }
+
+    #[test]
+    fn filter_with_no_confirmations_keeps_nothing_from_searched_files() {
+        let hits = vec![rg_hit("a.py", 1, "tenant_id = 1")];
+        let out = filter_matches(&hits, &[], &searched_set(&["a.py"]));
+        assert!(out.kept.is_empty());
+        assert_eq!(out.suppressed, 1);
+    }
+
+    #[test]
+    fn a_dot_slash_hit_matches_a_normalised_searched_path() {
+        // rg reports "./db.py"; the searched set is built with norm_path.
+        let hits = vec![rg_hit("./db.py", 1, "bypass_rls(conn)")];
+        let ag = parse_ag_matches(&ag_json("db.py", 0, "bypass_rls(conn)"));
+        let out = filter_matches(&hits, &ag, &searched_set(&["db.py"]));
+        assert_eq!(out.kept.len(), 1, "leading ./ must not defeat the searched lookup");
+        assert_eq!(out.suppressed, 0);
+    }
+
+    #[test]
+    fn a_language_that_confirms_nothing_is_treated_as_unsearched() {
+        // ast-grep against the wrong grammar exits 1 with no output AND no
+        // stderr, so "failed" and "found nothing" are indistinguishable. A real
+        // JS call inside a .html <script> block was being suppressed as noise.
+        let hits = vec![
+            rg_hit("app.py", 2, "    render_chart(data)"),
+            rg_hit("page.html", 2, "  render_chart(data);"),
+        ];
+        let ag = parse_ag_matches(&ag_json("app.py", 1, "    render_chart(data)"));
+        // Only python confirmed, so only python is in `searched`.
+        let out = filter_matches(&hits, &ag, &searched_set(&["app.py"]));
+        assert_eq!(out.kept.len(), 2, "the .html hit must survive: html confirmed nothing");
+        assert_eq!(out.suppressed, 0);
+    }
+
+    #[test]
+    fn a_language_that_confirms_nothing_is_excluded_from_searched() {
+        // The root-cause test for C1: a real JS call inside a .html file was
+        // suppressed because ast-grep parsed it as HTML and confirmed nothing —
+        // and a wrong-grammar run is indistinguishable from a genuine empty.
+        let mut by_lang: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+        by_lang.insert("python", strs(&["app.py"]));
+        by_lang.insert("html", strs(&["page.html"]));
+
+        // python confirms; html returns nothing, as a wrong-grammar run does.
+        let (ag, searched, confirming) = confirm_by_language(&by_lang, |lang, _files| {
+            if lang == "python" {
+                parse_ag_matches(&ag_json("app.py", 1, "    render_chart(d)"))
+            } else {
+                Vec::new()
+            }
+        });
+
+        assert_eq!(ag.len(), 1);
+        assert!(searched.contains("app.py"));
+        assert!(!searched.contains("page.html"), "html confirmed nothing => not searched");
+        assert_eq!(confirming, vec!["python"], "only confirming languages are credited");
+    }
+
+    // ── the comparison metric covers SEARCHED files only ──
+
+    #[test]
+    fn comparison_counts_exclude_unsearched_files() {
+        // Counting unsearched hits as rg_results while ast-grep never saw them
+        // would manufacture fake "noise avoided".
+        let hits = vec![
+            rg_hit("a.py", 1, "bypass_rls(conn)"),
+            rg_hit("a.py", 7, "# bypass_rls"),
+            rg_hit("notes.md", 2, "bypass_rls docs"),
+        ];
+        let ag = parse_ag_matches(&ag_json("a.py", 0, "bypass_rls(conn)"));
+        let out = filter_matches(&hits, &ag, &searched_set(&["a.py"]));
+        assert_eq!(out.searched_hits, 2, "only the two a.py hits");
+        assert_eq!(out.confirmed_hits, 1);
+    }
+
+    // ── render_output now renders ripgrep hits ──
+
     #[test]
     fn content_output_is_file_colon_line_colon_text() {
-        let m = parse_ag_matches(&ag_json("src/a.ts", 0, "const deviceId = 1;"));
+        let m = vec![rg_hit("src/a.ts", 1, "const deviceId = 1;")];
         assert_eq!(
             render_output(&m, OutputMode::Content { line_numbers: true }),
             "src/a.ts:1:const deviceId = 1;\n"
@@ -2120,8 +2784,7 @@ mod tests {
 
     #[test]
     fn content_output_omits_the_line_number_when_not_asked_for() {
-        // Piped `rg PATTERN src` prints `file:content` — no line field.
-        let m = parse_ag_matches(&ag_json("src/a.ts", 0, "const deviceId = 1;"));
+        let m = vec![rg_hit("src/a.ts", 1, "const deviceId = 1;")];
         assert_eq!(
             render_output(&m, OutputMode::Content { line_numbers: false }),
             "src/a.ts:const deviceId = 1;\n"
@@ -2219,6 +2882,89 @@ mod tests {
         assert_eq!(totals.tokens_saved, 0);
     }
 
+    // ── I1: events.lang is a comma-joined list of every CONFIRMING language,
+    // not always one — aggregating on the raw string fragments the KPI it
+    // feeds ──
+    //
+    // log_event's lang_label (main(), the confirming_langs.join(",") call)
+    // joins every language that actually confirmed a hit for a genuinely
+    // polyglot search. A naive `GROUP BY lang` then treats "python,typescript"
+    // as its own bucket, distinct from "python" and "typescript" — the more
+    // successful the polyglot fix is, the more it fragments its own metric.
+
+    fn seed_event(conn: &Connection, event: &str, pattern: &str, lang: &str, matches: u64) {
+        conn.execute(
+            "INSERT INTO events (agent, event, pattern, reason, lang, matches, ts)
+             VALUES ('claude-code', ?1, ?2, 'filtered', ?3, ?4, '1750000000.000Z')",
+            rusqlite::params![event, pattern, lang, matches],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn polyglot_lang_label_is_split_across_its_languages_not_its_own_bucket() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn);
+        // One polyglot redirect (both langs confirmed in the same event) plus
+        // two python-only redirects.
+        seed_event(&conn, "structural", "armingSnapshot($$$)", "python,typescript", 2);
+        seed_event(&conn, "structural", "otherCall($$$)", "python", 3);
+        seed_event(&conn, "structural", "thirdCall($$$)", "python", 1);
+
+        let counts = language_counts(&conn);
+        assert_eq!(counts.get("python"), Some(&3), "2 python-only events + 1 from the polyglot row");
+        assert_eq!(counts.get("typescript"), Some(&1), "only the polyglot row touched typescript");
+        assert_eq!(counts.get("python,typescript"), None, "must not survive as its own bucket");
+    }
+
+    #[test]
+    fn top_patterns_also_splits_the_comma_joined_lang() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn);
+        seed_event(&conn, "structural", "armingSnapshot($$$)", "python,typescript", 1);
+        seed_event(&conn, "structural", "armingSnapshot($$$)", "python", 1);
+
+        let top = top_pattern_stats(&conn);
+        let python_count: u64 = top
+            .iter()
+            .filter(|p| p.pattern == "armingSnapshot($$$)" && p.lang == "python")
+            .map(|p| p.count)
+            .sum();
+        assert_eq!(python_count, 2, "the polyglot row's count must fold into python too");
+        assert!(top.iter().all(|p| p.lang != "python,typescript"), "no composite bucket");
+    }
+
+    // ── I2: no_match (rg found nothing, ast-grep never ran) is neither a win
+    // nor a failure — it must not sit in the redirect-rate denominator, and
+    // it needs its own series rather than being folded into "Text" ──
+
+    #[test]
+    fn redirect_rate_excludes_no_match_from_the_denominator() {
+        // 1 structural win, 3 pure no-match searches: 100% of the searches
+        // that had anything TO redirect were in fact redirected.
+        assert_eq!(redirect_rate(4, 1, 3), 100.0);
+    }
+
+    #[test]
+    fn redirect_rate_is_zero_when_everything_is_a_no_match() {
+        assert_eq!(redirect_rate(3, 0, 3), 0.0, "0/0 after excluding no_match must not divide by zero");
+    }
+
+    #[test]
+    fn day_counts_carries_no_match_as_its_own_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn);
+        seed_event(&conn, "structural", "p", "python", 1);
+        seed_event(&conn, "no_match", "p2", "", 0);
+        seed_event(&conn, "no_match", "p3", "", 0);
+
+        let days = day_counts(&conn);
+        assert_eq!(days.len(), 1);
+        assert_eq!(days[0].total, 3);
+        assert_eq!(days[0].structural, 1);
+        assert_eq!(days[0].no_match, 2);
+    }
+
     #[test]
     fn line_number_preference_is_tracked() {
         assert_eq!(parse(&["-n", "deviceId", "src"]).line_numbers, Some(true));
@@ -2231,13 +2977,7 @@ mod tests {
 
     #[test]
     fn count_output_is_per_file_like_ripgrep() {
-        let stdout = format!(
-            "{}\n{}\n{}",
-            ag_json("src/a.ts", 0, "a"),
-            ag_json("src/a.ts", 4, "b"),
-            ag_json("src/b.ts", 2, "c")
-        );
-        let m = parse_ag_matches(&stdout);
+        let m = vec![rg_hit("src/a.ts", 1, "a"), rg_hit("src/a.ts", 5, "b"), rg_hit("src/b.ts", 3, "c")];
         assert_eq!(
             render_output(&m, OutputMode::Count { show_filename: true }),
             "src/a.ts:2\nsrc/b.ts:1\n"
@@ -2247,19 +2987,347 @@ mod tests {
     #[test]
     fn count_output_omits_the_filename_for_a_single_explicit_file() {
         // `rg -c PATTERN src/a.ts` prints a bare count, no path prefix.
-        let m = parse_ag_matches(&format!("{}\n{}", ag_json("src/a.ts", 0, "a"), ag_json("src/a.ts", 4, "b")));
+        let m = vec![rg_hit("src/a.ts", 1, "a"), rg_hit("src/a.ts", 5, "b")];
         assert_eq!(render_output(&m, OutputMode::Count { show_filename: false }), "2\n");
     }
 
     #[test]
     fn files_with_matches_output_is_sorted_and_deduped() {
-        let stdout = format!(
-            "{}\n{}\n{}",
-            ag_json("src/b.ts", 0, "a"),
-            ag_json("src/a.ts", 0, "b"),
-            ag_json("src/b.ts", 3, "c")
-        );
-        let m = parse_ag_matches(&stdout);
+        let m = vec![rg_hit("src/b.ts", 1, "a"), rg_hit("src/a.ts", 1, "b"), rg_hit("src/b.ts", 4, "c")];
         assert_eq!(render_output(&m, OutputMode::FilesWithMatches), "src/a.ts\nsrc/b.ts\n");
+    }
+
+    // ── ripgrep --json parsing ──
+
+    fn rg_json_match(file: &str, line: u64, text: &str) -> String {
+        format!(
+            r#"{{"type":"match","data":{{"path":{{"text":"{file}"}},"lines":{{"text":"{text}\n"}},"line_number":{line},"absolute_offset":0,"submatches":[]}}}}"#
+        )
+    }
+
+    #[test]
+    fn parses_a_match_record_with_one_based_line() {
+        let (m, _) = parse_rg_json(&rg_json_match("src/a.ts", 1, "const deviceId = 1;"));
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].file, "src/a.ts");
+        assert_eq!(m[0].line, 1, "ripgrep line_number is already 1-based");
+        assert_eq!(m[0].text, "const deviceId = 1;", "trailing newline stripped");
+    }
+
+    #[test]
+    fn parse_rg_json_reports_records_it_cannot_parse() {
+        // rg emits lines.bytes (base64) for a non-UTF-8 line. That record holds
+        // a real hit we cannot represent, so it must be COUNTED, not dropped.
+        let stream = format!(
+            "{}\n{}",
+            rg_json_match("a.py", 2, "render_chart(b)"),
+            r#"{"type":"match","data":{"path":{"text":"a.py"},"lines":{"bytes":"cmVuZGVy"},"line_number":1,"absolute_offset":0,"submatches":[]}}"#
+        );
+        let (matches, unparseable) = parse_rg_json(&stream);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(unparseable, 1, "the bytes-only record must be counted");
+    }
+
+    #[test]
+    fn parse_rg_json_reports_zero_unparseable_for_clean_input() {
+        let (matches, unparseable) = parse_rg_json(&rg_json_match("a.py", 1, "hit"));
+        assert_eq!(matches.len(), 1);
+        assert_eq!(unparseable, 0);
+    }
+
+    #[test]
+    fn ignores_non_match_records() {
+        let stream = format!(
+            "{}\n{}\n{}",
+            r#"{"type":"begin","data":{"path":{"text":"src/a.ts"}}}"#,
+            rg_json_match("src/a.ts", 3, "hit"),
+            r#"{"type":"end","data":{"path":{"text":"src/a.ts"}}}"#
+        );
+        let (m, _) = parse_rg_json(&stream);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].line, 3);
+    }
+
+    #[test]
+    fn empty_stream_yields_no_matches() {
+        assert!(parse_rg_json("").0.is_empty());
+    }
+
+    #[test]
+    fn crlf_line_endings_leave_no_stray_carriage_return() {
+        // Real `rg --json` emits "text\r\n" for a CRLF-terminated line. Stripping
+        // only '\n' baked a '\r' into every match from a Windows-authored file.
+        let stream = format!(
+            r#"{{"type":"match","data":{{"path":{{"text":"win.ts"}},"lines":{{"text":"const deviceId = 1;\r\n"}},"line_number":1,"absolute_offset":0,"submatches":[]}}}}"#
+        );
+        let (m, _) = parse_rg_json(&stream);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].text, "const deviceId = 1;", "no trailing \\r");
+    }
+
+    // ── --no-smart: ours, not ripgrep's ──
+
+    #[test]
+    fn no_smart_is_detected_without_eating_the_pattern() {
+        let inv = parse(&["--no-smart", "deviceId", "src"]);
+        assert!(inv.no_smart);
+        assert_eq!(inv.pattern.as_deref(), Some("deviceId"));
+        assert_eq!(inv.path, "src");
+    }
+
+    #[test]
+    fn no_smart_defaults_off() {
+        assert!(!parse(&["deviceId", "src"]).no_smart);
+    }
+
+    #[test]
+    fn strip_shim_flags_removes_only_our_flag() {
+        let inv = parse(&["-n", "--no-smart", "deviceId", "src"]);
+        let args = strs(&["-n", "--no-smart", "deviceId", "src"]);
+        assert_eq!(
+            strip_shim_flags(&args, &inv.shim_flag_indices),
+            strs(&["-n", "deviceId", "src"]),
+            "rg would reject --no-smart"
+        );
+    }
+
+    #[test]
+    fn no_smart_after_double_dash_is_a_pattern_not_a_flag() {
+        // `rg -- --no-smart` searches for that literal text. Stripping it left a
+        // bare `rg --`, which fails with "required argument <PATTERN>".
+        let inv = parse(&["--", "--no-smart", "src"]);
+        assert_eq!(inv.pattern.as_deref(), Some("--no-smart"));
+        assert!(!inv.no_smart);
+        let args = strs(&["--", "--no-smart", "src"]);
+        assert_eq!(strip_shim_flags(&args, &inv.shim_flag_indices), args,
+            "nothing after -- may be stripped");
+    }
+
+    #[test]
+    fn no_smart_as_a_flag_value_is_not_stripped() {
+        // `-e --no-smart src` searches for that literal in src. Stripping the
+        // value silently turned this into "search for src in the cwd".
+        let inv = parse(&["-e", "--no-smart", "src"]);
+        assert_eq!(inv.pattern.as_deref(), Some("--no-smart"));
+        assert!(!inv.no_smart);
+        let args = strs(&["-e", "--no-smart", "src"]);
+        assert_eq!(strip_shim_flags(&args, &inv.shim_flag_indices), args,
+            "-e's value must survive");
+    }
+
+    #[test]
+    fn no_smart_with_an_inline_value_is_stripped() {
+        let inv = parse(&["--no-smart=true", "deviceId", "src"]);
+        assert!(inv.no_smart);
+        let args = strs(&["--no-smart=true", "deviceId", "src"]);
+        assert_eq!(strip_shim_flags(&args, &inv.shim_flag_indices),
+            strs(&["deviceId", "src"]), "the =value spelling must strip too");
+    }
+
+    // ── language comes from the files that MATCHED ──
+
+    #[test]
+    fn polyglot_hits_split_into_one_group_per_language() {
+        let groups = group_files_by_lang(&strs(&["svc/a.py", "web/b.ts", "svc/c.py"]));
+        assert_eq!(groups.get("python"), Some(&strs(&["svc/a.py", "svc/c.py"])));
+        assert_eq!(groups.get("typescript"), Some(&strs(&["web/b.ts"])));
+        assert_eq!(groups.len(), 2);
+    }
+
+    #[test]
+    fn files_with_no_known_language_are_dropped() {
+        let groups = group_files_by_lang(&strs(&["README.md", "data.csv", "a.py"]));
+        assert_eq!(groups.len(), 1);
+        assert!(groups.contains_key("python"));
+    }
+
+    #[test]
+    fn grouping_is_deterministic() {
+        let groups = group_files_by_lang(&strs(&["b.ts", "a.py"]));
+        let langs: Vec<&str> = groups.keys().copied().collect();
+        assert_eq!(langs, vec!["python", "typescript"], "BTreeMap orders by language");
+    }
+
+    // ── capturing rg: capture_argv is a byproduct of the parser's own walk ──
+
+    #[test]
+    fn capture_argv_strips_output_modes_and_keeps_filters() {
+        let inv = parse(&["-c", "-n", "--heading", "-g", "*.ts", "deviceId", "src"]);
+        for stripped in ["-c", "-n", "--heading"] {
+            assert!(!inv.capture_argv.contains(&stripped.to_string()), "{stripped} must be stripped");
+        }
+        // Filters and positionals survive, in order.
+        assert!(inv.capture_argv.windows(2).any(|w| w == ["-g".to_string(), "*.ts".to_string()]));
+        assert!(inv.capture_argv.contains(&"deviceId".to_string()));
+        assert!(inv.capture_argv.contains(&"src".to_string()));
+    }
+
+    #[test]
+    fn capture_argv_keeps_the_type_filter_adjacent_to_its_value() {
+        let inv = parse(&["--type", "ts", "deviceId", "src"]);
+        assert!(inv.capture_argv.windows(2).any(|w| w == ["--type".to_string(), "ts".to_string()]));
+    }
+
+    #[test]
+    fn capture_argv_strips_bundled_short_output_flags() {
+        // `-nc` is ordinary ripgrep usage. Exact-token matching missed it, and
+        // rg's mode precedence let -c beat --json, so the capture came back as
+        // plain text and parsed to a silent false-empty.
+        let inv = parse(&["-nc", "deviceId", "src"]);
+        assert!(!inv.capture_argv.iter().any(|a| a == "-nc"), "bundled -nc must be stripped");
+        assert!(inv.capture_argv.contains(&"deviceId".to_string()));
+        assert!(inv.capture_argv.contains(&"src".to_string()));
+    }
+
+    #[test]
+    fn capture_argv_strips_bundled_cl() {
+        let inv = parse(&["-cl", "deviceId", "src"]);
+        assert!(!inv.capture_argv.iter().any(|a| a == "-cl"), "bundled -cl must be stripped");
+    }
+
+    #[test]
+    fn capture_argv_keeps_a_bare_dash_stdin_marker() {
+        let inv = parse(&["deviceId", "-"]);
+        assert!(inv.capture_argv.contains(&"-".to_string()), "a bare - is stdin, not a flag");
+    }
+
+    #[test]
+    fn vimgrep_and_passthru_force_passthrough() {
+        // --vimgrep wants file:line:COLUMN:text, which the shim does not emit.
+        // --passthru wants every line; under --json those are `context` records
+        // that parse_rg_json discards. Both are correct only via real rg.
+        assert_eq!(parse(&["--vimgrep", "deviceId", "src"]).unsupported.as_deref(), Some("--vimgrep"));
+        assert_eq!(parse(&["--passthru", "deviceId", "src"]).unsupported.as_deref(), Some("--passthru"));
+    }
+
+    #[test]
+    fn capture_argv_keeps_a_bundled_type_value() {
+        // `-tcpp` is `--type cpp`. Scanning every character saw the 'c' in the
+        // VALUE and dropped the caller's type filter entirely.
+        let inv = parse(&["-tcpp", "deviceId", "src"]);
+        assert!(inv.capture_argv.contains(&"-tcpp".to_string()), "-t's bundled value must survive");
+    }
+
+    #[test]
+    fn capture_argv_keeps_a_bundled_glob_value() {
+        let inv = parse(&["-g*.c", "deviceId", "src"]);
+        assert!(inv.capture_argv.contains(&"-g*.c".to_string()), "-g's bundled value must survive");
+    }
+
+    #[test]
+    fn capture_argv_keeps_a_bundled_pattern_value() {
+        // `-eDeviceId` carries the SEARCH TERM. Dropping it made ripgrep treat
+        // the path as the pattern — a silent wrong answer.
+        let inv = parse(&["-eDeviceId", "src"]);
+        assert!(inv.capture_argv.contains(&"-eDeviceId".to_string()), "-e's bundled pattern must survive");
+    }
+
+    #[test]
+    fn capture_argv_still_strips_output_mode_before_a_value_flag() {
+        // `-cg` is count bundled ahead of a glob: the 'c' comes first, so the
+        // token is rewritten to just `-g` (output mode dropped, filter kept).
+        let inv = parse(&["-cg", "*.ts", "deviceId", "src"]);
+        assert!(!inv.capture_argv.iter().any(|a| a == "-cg"), "bundled -cg token must be rewritten");
+        assert!(inv.capture_argv.contains(&"-g".to_string()), "-g must survive so *.ts stays its value");
+        assert!(inv.capture_argv.contains(&"*.ts".to_string()));
+    }
+
+    #[test]
+    fn capture_argv_keeps_the_glob_flag_from_a_mixed_bundle() {
+        // `-cg *.ts` is count + glob whose value is the NEXT token. Dropping the
+        // whole token orphaned "*.ts" as a bare positional, shifting ripgrep's
+        // pattern/path split and silently changing what is searched.
+        let inv = parse(&["-cg", "*.ts", "deviceId", "src"]);
+        assert!(inv.capture_argv.contains(&"-g".to_string()), "-g must survive so *.ts stays its value");
+        assert!(!inv.capture_argv.iter().any(|a| a == "-cg"));
+        assert!(inv.capture_argv.contains(&"*.ts".to_string()));
+    }
+
+    #[test]
+    fn capture_argv_keeps_an_inline_value_from_a_mixed_bundle() {
+        // `-ntrust` is -n bundled with `--type rust`. Rewriting keeps `-trust` so
+        // the type filter is preserved.
+        let inv = parse(&["-ntrust", "deviceId", "src"]);
+        assert!(inv.capture_argv.contains(&"-trust".to_string()), "the type filter must survive");
+    }
+
+    #[test]
+    fn capture_argv_keeps_the_pattern_flag_from_a_mixed_bundle() {
+        // `src -ce DeviceId`: -e carries the PATTERN. Rewriting to `-e` preserves it.
+        let inv = parse(&["src", "-ce", "DeviceId"]);
+        assert_eq!(inv.capture_argv, strs(&["src", "-e", "DeviceId"]));
+    }
+
+    #[test]
+    fn capture_argv_keeps_a_non_output_filter_from_a_bundle() {
+        // -w is a word-boundary FILTER; only the -n may be removed.
+        let inv = parse(&["-nw", "deviceId", "src"]);
+        assert!(inv.capture_argv.contains(&"-w".to_string()), "-w must survive");
+    }
+
+    #[test]
+    fn capture_argv_drops_a_token_that_is_only_output_modes() {
+        let inv = parse(&["-nc", "deviceId", "src"]);
+        assert!(!inv.capture_argv.iter().any(|a| a.starts_with('-')),
+            "-nc is purely output modes and must vanish entirely");
+    }
+
+    // ── round 4: capture_argv is a byproduct of the parser's own walk ──
+
+    #[test]
+    fn capture_argv_treats_everything_after_double_dash_as_positional() {
+        // `rg pattern -- -c` searches for `pattern` in a FILE named `-c`.
+        let inv = parse(&["pattern", "--", "-c"]);
+        assert_eq!(inv.capture_argv, strs(&["pattern", "--", "-c"]));
+    }
+
+    #[test]
+    fn capture_argv_never_mangles_a_post_double_dash_filename() {
+        // `-count.log` had its 'c' and 'n' stripped out of it.
+        let inv = parse(&["pattern", "--", "-count.log"]);
+        assert_eq!(inv.capture_argv, strs(&["pattern", "--", "-count.log"]));
+    }
+
+    #[test]
+    fn capture_argv_does_not_reinterpret_a_dash_prefixed_flag_value() {
+        // `rg -e -c src` searches for the literal text `-c` inside src/.
+        // Re-running "-c" through flag classification dropped it, so rg took
+        // "src" as the pattern and searched the cwd instead.
+        let inv = parse(&["-e", "-c", "src"]);
+        assert_eq!(inv.capture_argv, strs(&["-e", "-c", "src"]));
+    }
+
+    #[test]
+    fn capture_argv_omits_the_shim_own_flag() {
+        let inv = parse(&["--no-smart", "deviceId", "src"]);
+        assert_eq!(inv.capture_argv, strs(&["deviceId", "src"]));
+    }
+
+    #[test]
+    fn capture_command_args_prepends_json() {
+        assert_eq!(
+            capture_command_args(&strs(&["deviceId", "src"])),
+            strs(&["--json", "deviceId", "src"])
+        );
+    }
+
+    // ── round 5: ripgrep's own top-level modes, and the composed argv ──
+
+    #[test]
+    fn capture_argv_excludes_ripgreps_own_top_level_modes() {
+        // `rg --json --files src` prints a plain file list and exits 0, so it
+        // would parse to a silent false-empty. Excluded here so capture_argv
+        // does not rely on main()'s gate.
+        assert_eq!(parse(&["--files", "src"]).capture_argv, strs(&["src"]));
+        assert!(parse(&["--type-list"]).capture_argv.is_empty());
+    }
+
+    #[test]
+    fn capture_command_args_composes_with_the_parsers_argv() {
+        let inv = parse(&["-c", "-n", "--heading", "-g", "*.ts", "deviceId", "src"]);
+        assert_eq!(
+            capture_command_args(&inv.capture_argv),
+            strs(&["--json", "-g", "*.ts", "deviceId", "src"])
+        );
     }
 }

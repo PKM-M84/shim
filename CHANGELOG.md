@@ -5,6 +5,114 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.15] - 2026-07-27
+
+### Changed — invert the pipeline: ripgrep runs first, ast-grep filters its hits
+
+Measured over 1,379 events (30 days, live `agent=claude-code` traffic): only
+10.7% of intercepted searches actually redirected, and failed redirects
+(18.1%, ast-grep came back empty) outnumbered wins. Two real defects, not one:
+
+- **Language was guessed from the filesystem, not from the data.**
+  `infer_lang_from_path` picked one dominant language for the whole search
+  path, so on a polyglot repo the symbol usually lived in a language that
+  wasn't chosen — `arming_snapshot` alone was attempted as python (5×),
+  javascript (4×) and typescript (2×) before ever finding its actual `.ts`
+  file. `group_files_by_lang` now derives language from the extensions of the
+  files ripgrep **actually hit**, so every language present in the results
+  gets its own ast-grep pass, run once each rather than guessed once.
+- **`classify()` rejected the canonical way an agent writes a call search.**
+  An escaped literal like `store_mls_message\(` was 29 of 900 "not
+  structural" passthroughs — a real false negative, not a deliberate
+  rejection. `literal_form` now reduces an escaped pattern to its literal text
+  before classifying it, so `\(`, `\)`, and `\.` read as the structural
+  signals they are, while `\.env` (a leading/trailing dot) still reads as a
+  text search.
+
+The pipeline itself is now: parse → passthrough checks (stdin, pattern-less,
+unsupported flags) behave as before, plus the new `--no-smart` → `classify`
+says text, forward verbatim, unchanged → `classify` says structural:
+
+1. Run real ripgrep **captured** with `--json`, the user's filter flags kept,
+   output-mode flags stripped.
+2. Zero hits → print nothing, exit 1, log `no_match/rg_empty` — ast-grep is
+   never spawned for a search that was always going to be empty.
+3. Hits found → run ast-grep once per language against just the files that
+   matched, confirm each ripgrep hit by **containment**: does its line fall
+   anywhere inside a confirmed node's `[start, end]` span, not only at the
+   node's start line (a multi-line call's continuation-line arguments used to
+   be silently dropped by start-line equality). A file `group_files_by_lang`
+   can't map — `.sql`, `.md`, unmapped extensions — is never handed to
+   ast-grep, so it has no standing to suppress those hits; they're kept in
+   full. A language that confirms nothing is treated as unsearched for the
+   same reason, rather than as a wrong-grammar wipeout.
+4. All of a language's hits confirmed-empty → print every ripgrep hit for
+   those files and log `fallback`, honestly, instead of returning nothing.
+5. Otherwise → print the confirmed hits, and for the rest print a single
+   stderr notice (`N matches not confirmed as structural by ast-grep — rerun
+   with --no-smart`) instead of silently deleting them.
+
+- **New: `--no-smart`.** Forces plain ripgrep with no structural filtering,
+  for when you want every text match back. It is the remedy the suppression
+  notice points at, and it is stripped before forwarding so ripgrep never
+  sees a flag it does not recognise.
+
+Every successful redirect previously cost two spawns anyway (ast-grep, then a
+second rg run — `run_rg_count` — just for the comparison baseline); this
+inversion doesn't add a spawn on the win path and removes one on every
+zero-hit search. `run_rg_count` and the old flag-limited `run_ast_grep` are
+both deleted; `run_ast_grep_on_files` (explicit file list, not a directory
+walk, so ripgrep and ast-grep can no longer disagree about ignore rules)
+replaces them.
+
+Covered by `cargo test` (119 tests) — including containment against a
+synthetic multi-line node span, the one case a realistic fixture cannot
+produce, since ripgrep matches the very text that seeds the ast-grep node —
+and end-to-end against the release binary: polyglot symbols found in every
+language they appear in, unsearched-file-type hits kept in full,
+comment/string hits suppressed with the stderr notice, `--no-smart`
+restoring ripgrep's raw output, and a true no-match exiting 1 and logging
+`no_match/rg_empty`. The v0.3.13 nine-flag passthrough matrix (`-v`,
+`--invert-match`, `-A2`, `-C 1`, `-i`, `-m1`, `-o`, `-F`,
+`--files-without-match`) remains byte-identical to real ripgrep.
+
+### Fixed — two shapes of the inversion that silently dropped real hits
+
+`explicit_pattern` keeps exactly one `-e`/`--regexp` and discards the rest —
+harmless before this release, when that single pattern only decided WHETHER
+to redirect. Once `capture_argv` started forwarding every pattern token to
+the rg capture, ripgrep began answering the *union* of all of them while
+ast-grep kept filtering against the one pattern that survived, silently
+deleting every hit that only matched a *different* one:
+
+- **`rg -e A -e B`** (the flag spelling of an alternation, already out of
+  scope for redirect) now forces passthrough instead of returning only the
+  hits that matched `A`.
+- **`rg -f patterns.txt`** now forces passthrough instead of filtering
+  against the patterns *file's own name* — the parser stored the filename in
+  `explicit_pattern`, so a search for what the file listed was silently
+  answered as a search for the string `patterns.txt`.
+
+Both are semantics a single ast-grep pattern cannot express, so both now set
+`inv.unsupported` and go to real ripgrep whole — the same mechanism that
+already covers `-v`, `-C`, `-i`, and the rest of the deny-list. Verified
+byte-identical to real ripgrep on both shapes against the release binary.
+
+### Fixed — two ways the stats told on themselves
+
+- **The redirect rate no longer counts searches ripgrep answered with
+  nothing.** A `no_match` (rg found zero hits, so ast-grep never ran) is
+  neither a redirect nor a passthrough; counting it in the denominator
+  dragged the headline rate toward zero for any run of genuinely empty
+  searches. `no_match` now has its own bucket in `smart-rg stats` and its own
+  series in the report's time chart, and the rate describes only searches
+  that had something to route.
+- **`events.lang` can name several languages for one search**, now that
+  ast-grep runs once per language actually present in the results. The "By
+  Language" breakdown and "Top Redirected Patterns" now split that list
+  before counting, instead of treating `python,typescript` as a language of
+  its own, distinct from `python` and `typescript`.
+
 ## [0.3.14] - 2026-07-26
 
 ### Fixed — the report's headline numbers describe the whole dataset
