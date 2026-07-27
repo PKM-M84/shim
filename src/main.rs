@@ -2527,9 +2527,13 @@ mod tests {
 
     #[test]
     fn a_patterns_file_still_consumes_its_value() {
-        // Regression guard: -f must stay in short_takes_value, or "queries.txt"
-        // becomes a positional and then the pattern.
-        let inv = parse(&["-f", "queries.txt", "b.js"]);
+        // Regression guard: `-f` must stay in short_takes_value. If it did not,
+        // `queries.txt` would fall through as a positional and become the
+        // PATTERN, and `b.js` would be the only path — which is exactly the
+        // silent-wrong-search this fix exists to prevent. The path is written
+        // BEFORE the flag so the assertion actually distinguishes the two
+        // parses; with the path last, both readings yield paths == ["b.js"].
+        let inv = parse(&["b.js", "-f", "queries.txt"]);
         assert_eq!(inv.paths, strs(&["b.js"]), "queries.txt is -f's value, not a path");
     }
 

@@ -98,6 +98,21 @@ Both are semantics a single ast-grep pattern cannot express, so both now set
 already covers `-v`, `-C`, `-i`, and the rest of the deny-list. Verified
 byte-identical to real ripgrep on both shapes against the release binary.
 
+### Fixed — two ways the stats told on themselves
+
+- **The redirect rate no longer counts searches ripgrep answered with
+  nothing.** A `no_match` (rg found zero hits, so ast-grep never ran) is
+  neither a redirect nor a passthrough; counting it in the denominator
+  dragged the headline rate toward zero for any run of genuinely empty
+  searches. `no_match` now has its own bucket in `smart-rg stats` and its own
+  series in the report's time chart, and the rate describes only searches
+  that had something to route.
+- **`events.lang` can name several languages for one search**, now that
+  ast-grep runs once per language actually present in the results. The "By
+  Language" breakdown and "Top Redirected Patterns" now split that list
+  before counting, instead of treating `python,typescript` as a language of
+  its own, distinct from `python` and `typescript`.
+
 ## [0.3.14] - 2026-07-26
 
 ### Fixed — the report's headline numbers describe the whole dataset
