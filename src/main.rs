@@ -1195,24 +1195,39 @@ fn is_output_mode_short(c: char) -> bool {
     matches!(c, 'c' | 'l' | 'n' | 'N')
 }
 
-/// Does this short-flag TOKEN select an output mode?
+/// Rewrite a short-flag token for the internal `--json` capture run, dropping
+/// only the OUTPUT-MODE characters and keeping everything else.
 ///
-/// Scans characters left to right and STOPS at the first value-taking flag,
-/// because everything after it is that flag's value, not more flags. Without
-/// that stop, `-tcpp` (--type cpp), `-g*.c` (--glob) and `-eDeviceId` (the
-/// pattern) all contain a 'c' and would be dropped, silently discarding the
-/// caller's filter — or their search term. Mirrors the same boundary
-/// `parse_rg_invocation` uses, by calling the same predicate.
-fn short_token_is_output_mode(token: &str) -> bool {
-    for c in token.chars().skip(1) {
-        if is_output_mode_short(c) {
-            return true;
-        }
+/// Returns None when nothing survives (the token was purely output modes).
+///
+/// A bundle can legitimately mix modes with filters: `-cg` is count + glob,
+/// `-ntrust` is line-numbers + `--type rust`, `-ce` is count + the pattern flag.
+/// Dropping the whole token loses the filter — or, when the value sits in the
+/// NEXT argv token, strands it as a bare positional and silently changes
+/// ripgrep's pattern/path assignment. Scanning STOPS at the first value-taking
+/// char, because everything after it belongs to that flag's value and must be
+/// copied verbatim (`-tcpp` must never become `-tpp`).
+fn rewrite_short_token(token: &str) -> Option<String> {
+    let chars: Vec<char> = token.chars().skip(1).collect();
+    let mut kept = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
         if short_takes_value(c) {
-            break; // the rest of this token is the flag's value
+            // This flag and the rest of the token (its value) are copied as-is.
+            kept.extend(&chars[i..]);
+            break;
         }
+        if !is_output_mode_short(c) {
+            kept.push(c);
+        }
+        i += 1;
     }
-    false
+    if kept.is_empty() {
+        None
+    } else {
+        Some(format!("-{kept}"))
+    }
 }
 
 /// Build the argv for the internal ripgrep run: the caller's FILTER flags are
@@ -1234,11 +1249,13 @@ fn rg_capture_args(original: &[String]) -> Vec<String> {
         ) {
             continue;
         }
-        // Short-flag tokens may be BUNDLED (`-nc`, `-cl`). A bare `-` is
-        // ripgrep's stdin marker, not a flag, so require len >= 2.
-        if arg.len() >= 2 && arg.starts_with('-') && !arg.starts_with("--")
-            && short_token_is_output_mode(arg)
-        {
+        // Short-flag tokens may bundle modes with filters (`-cg`, `-ntrust`).
+        // Rewrite rather than drop: a bare `-` is ripgrep's stdin marker, not a
+        // flag, so require len >= 2.
+        if arg.len() >= 2 && arg.starts_with('-') && !arg.starts_with("--") {
+            if let Some(rewritten) = rewrite_short_token(arg) {
+                out.push(rewritten);
+            }
             continue;
         }
         out.push(arg.clone());
@@ -2880,8 +2897,50 @@ mod tests {
     #[test]
     fn rg_capture_args_still_strip_output_mode_before_a_value_flag() {
         // `-cg` is count bundled ahead of a glob: the 'c' comes first, so the
-        // token is still an output-mode token and must be stripped.
+        // token is rewritten to just `-g` (output mode dropped, filter kept).
         let out = rg_capture_args(&strs(&["-cg", "*.ts", "deviceId", "src"]));
-        assert!(!out.iter().any(|a| a == "-cg"), "leading -c must still strip");
+        assert!(!out.iter().any(|a| a == "-cg"), "bundled -cg token must be rewritten");
+        assert!(out.contains(&"-g".to_string()), "-g must survive so *.ts stays its value");
+        assert!(out.contains(&"*.ts".to_string()));
+    }
+
+    #[test]
+    fn rg_capture_args_keep_the_glob_flag_from_a_mixed_bundle() {
+        // `-cg *.ts` is count + glob whose value is the NEXT token. Dropping the
+        // whole token orphaned "*.ts" as a bare positional, shifting ripgrep's
+        // pattern/path split and silently changing what is searched.
+        let out = rg_capture_args(&strs(&["-cg", "*.ts", "deviceId", "src"]));
+        assert!(out.contains(&"-g".to_string()), "-g must survive so *.ts stays its value");
+        assert!(!out.iter().any(|a| a == "-cg"));
+        assert!(out.contains(&"*.ts".to_string()));
+    }
+
+    #[test]
+    fn rg_capture_args_keep_an_inline_value_from_a_mixed_bundle() {
+        // `-ntrust` is -n bundled with `--type rust`. Rewriting keeps `-trust` so
+        // the type filter is preserved.
+        let out = rg_capture_args(&strs(&["-ntrust", "deviceId", "src"]));
+        assert!(out.contains(&"-trust".to_string()), "the type filter must survive");
+    }
+
+    #[test]
+    fn rg_capture_args_keep_the_pattern_flag_from_a_mixed_bundle() {
+        // `src -ce DeviceId`: -e carries the PATTERN. Rewriting to `-e` preserves it.
+        let out = rg_capture_args(&strs(&["src", "-ce", "DeviceId"]));
+        assert_eq!(out, strs(&["--json", "src", "-e", "DeviceId"]));
+    }
+
+    #[test]
+    fn rg_capture_args_keep_a_non_output_filter_from_a_bundle() {
+        // -w is a word-boundary FILTER; only the -n may be removed.
+        let out = rg_capture_args(&strs(&["-nw", "deviceId", "src"]));
+        assert!(out.contains(&"-w".to_string()), "-w must survive");
+    }
+
+    #[test]
+    fn rg_capture_args_drop_a_token_that_is_only_output_modes() {
+        let out = rg_capture_args(&strs(&["-nc", "deviceId", "src"]));
+        assert!(!out.iter().any(|a| a.starts_with('-') && a != "--json"),
+            "-nc is purely output modes and must vanish entirely");
     }
 }
